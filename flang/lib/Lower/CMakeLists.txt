@@ -24,6 +24,7 @@ add_flang_library(FortranLower
   OpenACC.cpp
   OpenMP.cpp
   PFTBuilder.cpp
+  PFTDumper.cpp
   Runtime.cpp
   SymbolMap.cpp
   VectorSubscripts.cpp

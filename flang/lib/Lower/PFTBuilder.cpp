@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "flang/Lower/PFTBuilder.h"
+#include "flang/Lower/PFTDumper.h"
 #include "flang/Lower/IntervalSet.h"
 #include "flang/Lower/Support/Utils.h"
 #include "flang/Parser/dump-parse-tree.h"
@@ -1135,6 +1136,7 @@ public:
     else if (auto *dir = eval.getIf<Fortran::parser::CompilerDirective>())
       outputStream << ": !" << dir->source.ToString();
     outputStream << '\n';
+    ll::dumpEval(outputStream, eval);
     if (eval.hasNestedEvaluations()) {
       dumpEvaluationList(outputStream, *eval.evaluationList, indent + 1);
       outputStream << indentString << "<<End " << name << bang << ">>\n";
