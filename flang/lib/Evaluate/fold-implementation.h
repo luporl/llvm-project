@@ -1414,6 +1414,10 @@ auto MapOperation(FoldingContext &context,
       CHECK(rightIter != rightArrConst.end());
       auto &leftScalar{std::get<Expr<LEFT>>(leftValue.u)};
       auto &rightScalar{std::get<Expr<RIGHT>>(rightIter->u)};
+      if (rightIter == rightArrConst.begin() &&
+          leftScalar.Rank() != rightScalar.Rank()) {
+        return std::nullopt;
+      }
       result.Push(
           Fold(context, f(std::move(leftScalar), std::move(rightScalar))));
       ++rightIter;
