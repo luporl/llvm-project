@@ -84,6 +84,20 @@ std::size_t TotalElementCount(const ConstantSubscripts &shape) {
   return static_cast<std::size_t>(GetSize(shape));
 }
 
+bool TotalElementCountOverflows(const ConstantSubscripts &shape) {
+  uint64_t size{1};
+  for (auto dim : shape) {
+    CHECK(dim >= 0);
+    uint64_t osize{size};
+    size = osize * dim;
+    if (size > std::numeric_limits<decltype(dim)>::max() ||
+        (dim != 0 && size / dim != osize)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool ConstantBounds::IncrementSubscripts(
     ConstantSubscripts &indices, const std::vector<int> *dimOrder) const {
   int rank{GetRank(shape_)};

@@ -47,6 +47,7 @@ inline int GetRank(const ConstantSubscripts &s) {
 }
 
 std::size_t TotalElementCount(const ConstantSubscripts &);
+bool TotalElementCountOverflows(const ConstantSubscripts &);
 
 // Validate dimension re-ordering like ORDER in RESHAPE.
 // On success, return a vector that can be used as dimOrder in

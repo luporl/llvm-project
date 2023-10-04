@@ -878,6 +878,9 @@ template <typename T> Expr<T> Folder<T>::RESHAPE(FunctionRef<T> &&funcRef) {
   } else if (HasNegativeExtent(shape.value())) {
     context_.messages().Say(
         "'shape=' argument must not have a negative extent"_err_en_US);
+  } else if (TotalElementCountOverflows(shape.value())) {
+    context_.messages().Say(
+        "'shape=' argument has too many elements"_err_en_US);
   } else {
     int rank{GetRank(shape.value())};
     std::size_t resultElements{TotalElementCount(shape.value())};
