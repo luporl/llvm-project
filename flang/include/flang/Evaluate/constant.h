@@ -46,8 +46,8 @@ inline int GetRank(const ConstantSubscripts &s) {
   return static_cast<int>(s.size());
 }
 
-std::size_t TotalElementCount(const ConstantSubscripts &);
-bool TotalElementCountOverflows(const ConstantSubscripts &);
+// Returns the number of elements of shape, if no overflow occurs.
+std::optional<uint64_t> TotalElementCount(const ConstantSubscripts &shape);
 
 // Validate dimension re-ordering like ORDER in RESHAPE.
 // On success, return a vector that can be used as dimOrder in
