@@ -155,7 +155,6 @@ class DataSharingProcessor {
   llvm::SetVector<const Fortran::semantics::Symbol *> privatizedSymbols;
   llvm::SetVector<const Fortran::semantics::Symbol *> defaultSymbols;
   llvm::SetVector<const Fortran::semantics::Symbol *> symbolsInNestedRegions;
-  llvm::SetVector<const Fortran::semantics::Symbol *> symbolsInParentRegions;
   Fortran::lower::AbstractConverter &converter;
   fir::FirOpBuilder &firOpBuilder;
   const Fortran::parser::OmpClauseList &opClauseList;
@@ -462,14 +461,10 @@ void DataSharingProcessor::collectSymbols(
                              /*collectSymbols=*/true,
                              /*collectHostAssociatedSymbols=*/true);
   for (Fortran::lower::pft::Evaluation &e : eval.getNestedEvaluations()) {
-    if (e.hasNestedEvaluations())
+    if (e.hasNestedEvaluations() && !e.isConstruct())
       converter.collectSymbolSet(e, symbolsInNestedRegions, flag,
                                  /*collectSymbols=*/true,
                                  /*collectHostAssociatedSymbols=*/false);
-    else
-      converter.collectSymbolSet(e, symbolsInParentRegions, flag,
-                                 /*collectSymbols=*/false,
-                                 /*collectHostAssociatedSymbols=*/true);
   }
 }
 
@@ -521,7 +516,6 @@ void DataSharingProcessor::defaultPrivatize() {
         !sym->GetUltimate().has<Fortran::semantics::DerivedTypeDetails>() &&
         !sym->GetUltimate().has<Fortran::semantics::NamelistDetails>() &&
         !symbolsInNestedRegions.contains(sym) &&
-        !symbolsInParentRegions.contains(sym) &&
         !privatizedSymbols.contains(sym)) {
       cloneSymbol(sym);
       copyFirstPrivateSymbol(sym);
