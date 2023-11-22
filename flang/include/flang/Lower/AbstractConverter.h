@@ -51,6 +51,7 @@ class DerivedTypeSpec;
 } // namespace semantics
 
 namespace lower {
+struct SymbolBox;
 class SymMap;
 namespace pft {
 struct Variable;
@@ -111,12 +112,34 @@ public:
   virtual bool
   createHostAssociateVarClone(const Fortran::semantics::Symbol &sym) = 0;
 
+  /// For a given symbol which may not be host-associated, create a clone using
+  /// parameters from the symbol or from the host-associated symbol, if any.
+  /// This member function does not insert the clone in the symbol table and
+  /// does not initialize it.
+  virtual Fortran::lower::SymbolBox
+  createVarClone(const Fortran::semantics::Symbol &sym) = 0;
+
+  /// Initialize a previously created clone.
+  virtual void initVarClone(const Fortran::semantics::Symbol &sym,
+                            const Fortran::lower::SymbolBox &clone) = 0;
+
   virtual void
   createHostAssociateVarCloneDealloc(const Fortran::semantics::Symbol &sym) = 0;
+
+  virtual void createVarCloneDealloc(const Fortran::semantics::Symbol &sym,
+                                     Fortran::lower::SymbolBox &sb) = 0;
 
   virtual void copyHostAssociateVar(
       const Fortran::semantics::Symbol &sym,
       mlir::OpBuilder::InsertPoint *copyAssignIP = nullptr) = 0;
+
+  virtual void copyVar(const Fortran::semantics::Symbol &dst,
+                       const Fortran::lower::SymbolBox &src,
+                       bool needBarrier = false) = 0;
+
+  virtual void copyVar(const Fortran::lower::SymbolBox &dst,
+                       const Fortran::semantics::Symbol &src,
+                       bool needBarrier = false) = 0;
 
   /// For a given symbol, check if it is present in the inner-most
   /// level of the symbol map.

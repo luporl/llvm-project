@@ -18,6 +18,7 @@
 #include "flang/Lower/ConvertVariable.h"
 #include "flang/Lower/PFTBuilder.h"
 #include "flang/Lower/StatementContext.h"
+#include "flang/Lower/SymbolMap.h"
 #include "flang/Optimizer/Builder/BoxValue.h"
 #include "flang/Optimizer/Builder/FIRBuilder.h"
 #include "flang/Optimizer/Builder/Todo.h"
@@ -561,6 +562,7 @@ public:
   processAllocate(llvm::SmallVectorImpl<mlir::Value> &allocatorOperands,
                   llvm::SmallVectorImpl<mlir::Value> &allocateOperands) const;
   bool processCopyin() const;
+  bool processCopyPrivate(mlir::Operation *singleOp) const;
   bool processDepend(llvm::SmallVectorImpl<mlir::Attribute> &dependTypeOperands,
                      llvm::SmallVectorImpl<mlir::Value> &dependOperands) const;
   bool
@@ -1631,6 +1633,67 @@ bool ClauseProcessor::processCopyin() const {
   return hasCopyin;
 }
 
+bool ClauseProcessor::processCopyPrivate(mlir::Operation *singleOp) const {
+  fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+  assert(singleOp->getNumRegions() == 1 && !singleOp->getRegion(0).empty());
+
+  auto copyPrivateVar = [&](Fortran::semantics::Symbol *sym) {
+    // If we are inside a parallel operation, then create a clone before it,
+    // else insert the clone right before the single operation.
+    mlir::Operation *insOp = singleOp->getParentOp();
+    while (insOp) {
+      if (mlir::dyn_cast<mlir::omp::ParallelOp>(insOp))
+        break;
+      insOp = insOp->getParentOp();
+    }
+    if (!insOp)
+      insOp = singleOp;
+    firOpBuilder.setInsertionPoint(insOp);
+    Fortran::lower::SymbolBox clone = converter.createVarClone(*sym);
+    // Initialize clone, at the end of the single region.
+    mlir::Operation *lastOp = singleOp->getRegion(0).back().getTerminator();
+    firOpBuilder.setInsertionPoint(lastOp);
+    converter.initVarClone(*sym, clone);
+    converter.copyVar(clone, *sym);
+    // Reload the private variable from the clone, after the single operation.
+    // For ALLOCATABLE variables, the copy will happen inside an if-allocated
+    // block and this is where the barrier will be inserted. This can cause
+    // a hang if some threads have allocated the variable and others not.
+    // Luckly, OpenMP spec [OMP 5.2, 5.7.2] states that any list item with the
+    // ALLOCATABLE attribute must have the allocation status of allocated when
+    // the intrinsic assignment is performed.
+    firOpBuilder.setInsertionPointAfter(singleOp);
+    converter.copyVar(*sym, clone, /*needBarrier=*/true);
+    converter.createVarCloneDealloc(*sym, clone);
+  };
+
+  bool hasCopyPrivate = findRepeatableClause<ClauseTy::Copyprivate>(
+      [&](const ClauseTy::Copyprivate *copyPrivateClause,
+          const Fortran::parser::CharBlock &) {
+        const Fortran::parser::OmpObjectList &ompObjectList =
+            copyPrivateClause->v;
+        for (const Fortran::parser::OmpObject &ompObject : ompObjectList.v) {
+          Fortran::semantics::Symbol *sym = getOmpObjectSymbol(ompObject);
+          if (const auto *commonDetails =
+                  sym->detailsIf<Fortran::semantics::CommonBlockDetails>()) {
+            for (const auto &mem : commonDetails->objects())
+              copyPrivateVar(&*mem);
+            break;
+          }
+          copyPrivateVar(sym);
+        }
+      });
+
+  if (hasCopyPrivate) {
+    // Set insertion point to start of region.
+    // At least a terminator should be present.
+    auto &ops = singleOp->getRegion(0).front().getOperations();
+    assert(!ops.empty() && "Unexpected empty region");
+    firOpBuilder.setInsertionPoint(&ops.front());
+  }
+  return hasCopyPrivate;
+}
+
 bool ClauseProcessor::processDepend(
     llvm::SmallVectorImpl<mlir::Attribute> &dependTypeOperands,
     llvm::SmallVectorImpl<mlir::Value> &dependOperands) const {
@@ -2339,14 +2402,15 @@ genSingleOp(Fortran::lower::AbstractConverter &converter,
 
   ClauseProcessor cp(converter, beginClauseList);
   cp.processAllocate(allocatorOperands, allocateOperands);
-  cp.processTODO<Fortran::parser::OmpClause::Copyprivate>(
-      currentLocation, llvm::omp::Directive::OMPD_single);
 
-  ClauseProcessor(converter, endClauseList).processNowait(nowaitAttr);
+  ClauseProcessor ecp(converter, endClauseList);
+  ecp.processNowait(nowaitAttr);
 
-  return genOpWithBody<mlir::omp::SingleOp>(
+  auto singleOp = genOpWithBody<mlir::omp::SingleOp>(
       converter, eval, currentLocation, /*outerCombined=*/false,
       &beginClauseList, allocateOperands, allocatorOperands, nowaitAttr);
+  ecp.processCopyPrivate(singleOp);
+  return singleOp;
 }
 
 static mlir::omp::TaskOp
@@ -3123,7 +3187,8 @@ genOMP(Fortran::lower::AbstractConverter &converter,
 
   for (const auto &clause : endClauseList.v) {
     mlir::Location clauseLocation = converter.genLocation(clause.source);
-    if (!std::get_if<Fortran::parser::OmpClause::Nowait>(&clause.u))
+    if (!std::get_if<Fortran::parser::OmpClause::Nowait>(&clause.u) &&
+        !std::get_if<Fortran::parser::OmpClause::Copyprivate>(&clause.u))
       TODO(clauseLocation, "OpenMP Block construct clause");
   }
 
