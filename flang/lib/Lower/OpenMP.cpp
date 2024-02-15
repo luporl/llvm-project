@@ -26,6 +26,7 @@
 #include "flang/Parser/dump-parse-tree.h"
 #include "flang/Parser/parse-tree.h"
 #include "flang/Semantics/openmp-directive-sets.h"
+#include "flang/Semantics/symbol.h"
 #include "flang/Semantics/tools.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
@@ -34,6 +35,8 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Frontend/OpenMP/OMPConstants.h"
 #include "llvm/Support/CommandLine.h"
+
+#include "flang/lldbg.h"
 
 static llvm::cl::opt<bool> treatIndexAsSection(
     "openmp-treat-index-as-section",
@@ -154,6 +157,7 @@ class DataSharingProcessor {
   // Symbols in private, firstprivate, and/or lastprivate clauses.
   llvm::SetVector<const Fortran::semantics::Symbol *> privatizedSymbols;
   llvm::SetVector<const Fortran::semantics::Symbol *> defaultSymbols;
+  llvm::SetVector<const Fortran::semantics::Symbol *> implicitSymbols;
   llvm::SetVector<const Fortran::semantics::Symbol *> symbolsInNestedRegions;
   Fortran::lower::AbstractConverter &converter;
   fir::FirOpBuilder &firOpBuilder;
@@ -168,8 +172,11 @@ class DataSharingProcessor {
   void collectSymbolsForPrivatization();
   void insertBarrier();
   void collectDefaultSymbols();
+  void collectImplicitSymbols();
   void privatize();
+  bool isPrivatizable(const Fortran::semantics::Symbol &sym) const;
   void defaultPrivatize();
+  void implicitPrivatize();
   void copyLastPrivatize(mlir::Operation *op);
   void insertLastPrivateCompare(mlir::Operation *op);
   void cloneSymbol(const Fortran::semantics::Symbol *sym);
@@ -208,8 +215,10 @@ public:
 void DataSharingProcessor::processStep1() {
   collectSymbolsForPrivatization();
   collectDefaultSymbols();
+  collectImplicitSymbols();
   privatize();
   defaultPrivatize();
+  implicitPrivatize();
   insertBarrier();
 }
 
@@ -455,20 +464,43 @@ void DataSharingProcessor::insertLastPrivateCompare(mlir::Operation *op) {
   firOpBuilder.restoreInsertionPoint(localInsPt);
 }
 
+#define DUMP_DEFAULT                                        \
+    for (const auto &sym : defaultSymbols)                  \
+      dbg << "default: " << *sym << NL
+
+#define DUMP_NESTED                                         \
+    for (const auto &sym : symbolsInNestedRegions)          \
+      dbg << "nested: " << *sym << NL
+
+#define DUMP_IMPLICIT                                       \
+    for (const auto &sym : symbolsInNestedRegions)          \
+      dbg << "nested: " << *sym << NL
+
 void DataSharingProcessor::collectSymbols(
     Fortran::semantics::Symbol::Flag flag) {
+  LLDBG(1);
+
   converter.collectSymbolSet(eval, defaultSymbols, flag,
                              /*collectSymbols=*/true,
                              /*collectHostAssociatedSymbols=*/true);
+  dbg << NL;
+  dbg << "eval:\n"; DBG(eval.dump());
+  dbg << NL;
+  DUMP_DEFAULT;
   for (Fortran::lower::pft::Evaluation &e : eval.getNestedEvaluations()) {
-    if (e.hasNestedEvaluations() && !e.isConstruct())
+    if (e.hasNestedEvaluations() && !e.isConstruct()) {
+      dbg << "nested:\n"; DBG(e.dump()); dbg << NL;
       converter.collectSymbolSet(e, symbolsInNestedRegions, flag,
                                  /*collectSymbols=*/true,
                                  /*collectHostAssociatedSymbols=*/false);
+      DUMP_NESTED;
+    }
   }
 }
 
 void DataSharingProcessor::collectDefaultSymbols() {
+  LLDBG(1);
+
   for (const Fortran::parser::OmpClause &clause : opClauseList.v) {
     if (const auto &defaultClause =
             std::get_if<Fortran::parser::OmpClause::Default>(&clause.u)) {
@@ -480,6 +512,24 @@ void DataSharingProcessor::collectDefaultSymbols() {
         collectSymbols(Fortran::semantics::Symbol::Flag::OmpFirstPrivate);
     }
   }
+
+  DUMP_DEFAULT;
+  DUMP_NESTED;
+}
+
+void DataSharingProcessor::collectImplicitSymbols() {
+  LLDBG(1);
+
+#if 1
+  converter.collectSymbolSet(eval, implicitSymbols,
+                             Fortran::semantics::Symbol::Flag::OmpImplicit,
+                             /*collectSymbols=*/true,
+                             /*collectHostAssociatedSymbols=*/true);
+  dbg << NL;
+  dbg << "eval:\n"; DBG(eval.dump());
+  dbg << NL;
+  DUMP_IMPLICIT;
+#endif
 }
 
 void DataSharingProcessor::privatize() {
@@ -510,13 +560,30 @@ void DataSharingProcessor::copyLastPrivatize(mlir::Operation *op) {
     }
 }
 
+bool DataSharingProcessor::isPrivatizable(const Fortran::semantics::Symbol &sym) const
+{
+  return !Fortran::semantics::IsProcedure(sym) &&
+    !sym.GetUltimate().has<Fortran::semantics::DerivedTypeDetails>() &&
+    !sym.GetUltimate().has<Fortran::semantics::NamelistDetails>();
+}
+
 void DataSharingProcessor::defaultPrivatize() {
   for (const Fortran::semantics::Symbol *sym : defaultSymbols) {
-    if (!Fortran::semantics::IsProcedure(*sym) &&
-        !sym->GetUltimate().has<Fortran::semantics::DerivedTypeDetails>() &&
-        !sym->GetUltimate().has<Fortran::semantics::NamelistDetails>() &&
+    if (isPrivatizable(*sym) &&
         !symbolsInNestedRegions.contains(sym) &&
         !privatizedSymbols.contains(sym)) {
+      cloneSymbol(sym);
+      copyFirstPrivateSymbol(sym);
+    }
+  }
+}
+
+void DataSharingProcessor::implicitPrivatize() {
+  for (const Fortran::semantics::Symbol *sym : implicitSymbols) {
+    if (isPrivatizable(*sym) && !defaultSymbols.contains(sym) &&
+        !privatizedSymbols.contains(sym) &&
+        !sym->test(Fortran::semantics::Symbol::Flag::OmpShared)) {
+      assert(sym->test(Fortran::semantics::Symbol::Flag::OmpFirstPrivate));
       cloneSymbol(sym);
       copyFirstPrivateSymbol(sym);
     }

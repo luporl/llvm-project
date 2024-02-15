@@ -23,6 +23,8 @@
 #include <map>
 #include <sstream>
 
+#include "flang/lldbg.h"
+
 template <typename T>
 static Fortran::semantics::Scope *GetScope(
     Fortran::semantics::SemanticsContext &context, const T &x) {
@@ -1980,6 +1982,7 @@ void OmpAttributeVisitor::Post(const parser::OpenMPAllocatorsConstruct &x) {
 // For OpenMP constructs, check all the data-refs within the constructs
 // and adjust the symbol for each Name if necessary
 void OmpAttributeVisitor::Post(const parser::Name &name) {
+  LLDBG(1);
   auto *symbol{name.symbol};
   if (symbol && !dirContext_.empty() && GetContext().withinConstruct) {
     if (!symbol->owner().IsDerivedType() && !IsProcedure(*symbol) &&
@@ -2009,23 +2012,49 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
         return;
     }
     std::vector<Symbol *> defaultDSASymbols;
+    std::optional<Symbol::Flag> prevDSA;
+    // foreach directive
     for (int dirDepth{0}; dirDepth < (int)dirContext_.size(); ++dirDepth) {
       DirContext &dirContext = dirContext_[dirDepth];
+      std::optional<Symbol::Flag> dsa;
       bool hasDataSharingAttr{false};
       for (auto symMap : dirContext.objectWithDSA) {
         // if the `symbol` already has a data-sharing attribute
         if (symMap.first->name() == name.symbol->name()) {
           hasDataSharingAttr = true;
+          dsa = symMap.second;
           break;
         }
       }
+
+      auto dir = dirContext.directive;
+      bool taskGenDir = llvm::omp::taskGeneratingSet.test(dir);
+      bool targetDir = llvm::omp::allTargetSet.test(dir);
+      (void)taskGenDir;
+      (void)targetDir;
+      dbg << "sym=" << symbol->name()
+        << " dir=" << dirDepth
+        << ": " << getOpenMPDirectiveName(dir);
+      if (dsa.has_value())
+        dbg << " dsa=" << *dsa;
+      dbg << NL;
+
+      // has DSA: done
       if (hasDataSharingAttr) {
+        // if outer symbol has default DSA, add new host-assoc symbol
+        // XXX looks wrong, as it seems default shouldn't be "inherited".
         if (defaultDSASymbols.size())
           symbol = &MakeAssocSymbol(symbol->name(), *defaultDSASymbols.back(),
               context_.FindScope(dirContext.directiveSource));
-        continue;
+        goto next;
       }
 
+      // no DSA
+
+      // use the one from default clause (adds new host-assoc symbol)
+      // handles (1)
+      // XXX allowing any directive, not only parallel, teams amd tasl
+      // generating constructs.
       if (dirContext.defaultDSA == semantics::Symbol::Flag::OmpPrivate ||
           dirContext.defaultDSA == semantics::Symbol::Flag::OmpFirstPrivate) {
         Symbol *hostSymbol = defaultDSASymbols.size() ? defaultDSASymbols.back()
@@ -2033,9 +2062,55 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
         defaultDSASymbols.push_back(
             DeclarePrivateAccessEntity(*hostSymbol, dirContext.defaultDSA,
                 context_.FindScope(dirContext.directiveSource)));
-      } else if (defaultDSASymbols.size())
+        dsa = dirContext.defaultDSA;
+        dbg << "1: " << *dsa << NL;
+      }
+      // (2) parallel -> shared
+      // else if (llvm::omp::allParallelSet.test(dirContext.directive))
+      //  ;
+      // (3) use enclosing ctx for non-task generating constructs only
+      //     (non-default cases already handled above)
+      else if (!taskGenDir && !targetDir && defaultDSASymbols.size()) {
         symbol = &MakeAssocSymbol(symbol->name(), *defaultDSASymbols.back(),
             context_.FindScope(dirContext.directiveSource));
+
+        Symbol::Flags flags = defaultDSASymbols.back()->flags();
+        if (flags.test(Symbol::Flag::OmpPrivate)) {
+          dsa = Symbol::Flag::OmpPrivate;
+        } else if (flags.test(Symbol::Flag::OmpFirstPrivate)) {
+          dsa = Symbol::Flag::OmpFirstPrivate;
+        }
+        dbg << "3: " << *dsa << NL;
+      }
+      // (4) target -> firstprivate
+      // else if (targetDir) { }
+      // TODO (5) orphaned taskgen dummy args -> firstprivate
+      else if (taskGenDir) {
+        // (6) check if taskgen is shared in enclosing context
+        dbg << "prevDSA=";
+        if (prevDSA)
+          dbg << *prevDSA;
+        else
+          dbg << "null";
+        dbg << NL;
+        if (prevDSA && !privateDataSharingAttributeFlags.test(*prevDSA)) {
+          dsa = Symbol::Flag::OmpShared;
+          dbg << "6: " << *dsa << NL;
+        // (7) firstprivate
+        } else {
+          dsa = Symbol::Flag::OmpFirstPrivate;
+          Symbol *hostSymbol = &symbol->GetUltimate();
+          Symbol *privSym = DeclarePrivateAccessEntity(*hostSymbol, *dsa,
+              context_.FindScope(dirContext.directiveSource));
+          assert(privSym);
+          privSym->set(Symbol::Flag::OmpImplicit);
+          dbg << "7: " << *dsa << NL;
+        }
+      }
+
+      // else: DSA == shared
+    next:
+      prevDSA = dsa ? *dsa : Symbol::Flag::OmpShared;
     }
   } // within OpenMP construct
 }
