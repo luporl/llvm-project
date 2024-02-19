@@ -464,17 +464,17 @@ void DataSharingProcessor::insertLastPrivateCompare(mlir::Operation *op) {
   firOpBuilder.restoreInsertionPoint(localInsPt);
 }
 
-#define DUMP_DEFAULT                                        \
-    for (const auto &sym : defaultSymbols)                  \
-      dbg << "default: " << *sym << NL
+#define DUMP_DEFAULT                                                           \
+  for (const auto &sym : defaultSymbols)                                       \
+  dbg << "default: " << *sym << NL
 
-#define DUMP_NESTED                                         \
-    for (const auto &sym : symbolsInNestedRegions)          \
-      dbg << "nested: " << *sym << NL
+#define DUMP_NESTED                                                            \
+  for (const auto &sym : symbolsInNestedRegions)                               \
+  dbg << "nested: " << *sym << NL
 
-#define DUMP_IMPLICIT                                       \
-    for (const auto &sym : implicitSymbols)                 \
-      dbg << "implicit: " << *sym << NL
+#define DUMP_IMPLICIT                                                          \
+  for (const auto &sym : implicitSymbols)                                      \
+  dbg << "implicit: " << *sym << NL
 
 void DataSharingProcessor::collectSymbols(
     Fortran::semantics::Symbol::Flag flag) {
@@ -484,12 +484,15 @@ void DataSharingProcessor::collectSymbols(
                              /*collectSymbols=*/true,
                              /*collectHostAssociatedSymbols=*/true);
   dbg << NL;
-  dbg << "eval:\n"; DBG(eval.dump());
+  dbg << "eval:\n";
+  DBG(eval.dump());
   dbg << NL;
   DUMP_DEFAULT;
   for (Fortran::lower::pft::Evaluation &e : eval.getNestedEvaluations()) {
     if (e.hasNestedEvaluations() && !e.isConstruct()) {
-      dbg << "nested:\n"; DBG(e.dump()); dbg << NL;
+      dbg << "nested:\n";
+      DBG(e.dump());
+      dbg << NL;
       converter.collectSymbolSet(e, symbolsInNestedRegions, flag,
                                  /*collectSymbols=*/true,
                                  /*collectHostAssociatedSymbols=*/false);
@@ -526,7 +529,8 @@ void DataSharingProcessor::collectImplicitSymbols() {
                              /*collectSymbols=*/true,
                              /*collectHostAssociatedSymbols=*/true);
   dbg << NL;
-  dbg << "eval:\n"; DBG(eval.dump());
+  dbg << "eval:\n";
+  DBG(eval.dump());
   dbg << NL;
   DUMP_IMPLICIT;
 #endif
@@ -560,17 +564,16 @@ void DataSharingProcessor::copyLastPrivatize(mlir::Operation *op) {
     }
 }
 
-bool DataSharingProcessor::isPrivatizable(const Fortran::semantics::Symbol &sym) const
-{
+bool DataSharingProcessor::isPrivatizable(
+    const Fortran::semantics::Symbol &sym) const {
   return !Fortran::semantics::IsProcedure(sym) &&
-    !sym.GetUltimate().has<Fortran::semantics::DerivedTypeDetails>() &&
-    !sym.GetUltimate().has<Fortran::semantics::NamelistDetails>();
+         !sym.GetUltimate().has<Fortran::semantics::DerivedTypeDetails>() &&
+         !sym.GetUltimate().has<Fortran::semantics::NamelistDetails>();
 }
 
 void DataSharingProcessor::defaultPrivatize() {
   for (const Fortran::semantics::Symbol *sym : defaultSymbols) {
-    if (isPrivatizable(*sym) &&
-        !symbolsInNestedRegions.contains(sym) &&
+    if (isPrivatizable(*sym) && !symbolsInNestedRegions.contains(sym) &&
         !privatizedSymbols.contains(sym)) {
       cloneSymbol(sym);
       copyFirstPrivateSymbol(sym);

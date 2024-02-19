@@ -2058,9 +2058,8 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
       bool targetDir = llvm::omp::allTargetSet.test(dir);
       (void)taskGenDir;
       (void)targetDir;
-      dbg << "sym=" << symbol->name()
-        << " dir=" << dirDepth
-        << ": " << getOpenMPDirectiveName(dir);
+      dbg << "sym=" << symbol->name() << " dir=" << dirDepth << ": "
+          << getOpenMPDirectiveName(dir);
       if (dsa.has_value())
         dbg << " dsa=" << *dsa;
 
@@ -2132,7 +2131,7 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
         if (prevDSA && !privateDataSharingAttributeFlags.test(*prevDSA)) {
           dsa = Symbol::Flag::OmpShared;
           dbg << " 6: " << *dsa << NL;
-        // (7) firstprivate
+          // (7) firstprivate
         } else {
           dsa = Symbol::Flag::OmpFirstPrivate;
           Symbol *hostSymbol = &symbol->GetUltimate();
