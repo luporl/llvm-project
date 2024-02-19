@@ -112,6 +112,9 @@ protected:
   Symbol *DeclarePrivateAccessEntity(
       const parser::Name &, Symbol::Flag, Scope &);
   Symbol *DeclarePrivateAccessEntity(Symbol &, Symbol::Flag, Scope &);
+  Symbol *DeclareSharedAccessEntity(
+      const parser::Name &, Symbol::Flag, Scope &);
+  Symbol *DeclareSharedAccessEntity(Symbol &, Symbol::Flag, Scope &);
   Symbol *DeclareOrMarkOtherAccessEntity(const parser::Name &, Symbol::Flag);
 
   UnorderedSymbolSet dataSharingAttributeObjects_; // on one directive
@@ -786,6 +789,29 @@ Symbol *DirectiveAttributeVisitor<T>::DeclarePrivateAccessEntity(
       // The symbol in copyin clause must be threadprivate entity.
       symbol.set(Symbol::Flag::OmpThreadprivate);
     }
+    return &symbol;
+  } else {
+    object.set(flag);
+    return &object;
+  }
+}
+
+template <typename T>
+Symbol *DirectiveAttributeVisitor<T>::DeclareSharedAccessEntity(
+    const parser::Name &name, Symbol::Flag flag, Scope &scope) {
+  if (!name.symbol) {
+    return nullptr; // not resolved by Name Resolution step, do nothing
+  }
+  name.symbol = DeclareSharedAccessEntity(*name.symbol, flag, scope);
+  return name.symbol;
+}
+
+template <typename T>
+Symbol *DirectiveAttributeVisitor<T>::DeclareSharedAccessEntity(
+    Symbol &object, Symbol::Flag flag, Scope &scope) {
+  if (object.owner() != currScope()) {
+    auto &symbol{MakeAssocSymbol(object.name(), object, scope)};
+    symbol.set(flag);
     return &symbol;
   } else {
     object.set(flag);
@@ -2013,7 +2039,7 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
     }
     std::vector<Symbol *> defaultDSASymbols;
     std::optional<Symbol::Flag> prevDSA;
-    // foreach directive
+    dbg << "foreach directive" << NL;
     for (int dirDepth{0}; dirDepth < (int)dirContext_.size(); ++dirDepth) {
       DirContext &dirContext = dirContext_[dirDepth];
       std::optional<Symbol::Flag> dsa;
@@ -2037,7 +2063,6 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
         << ": " << getOpenMPDirectiveName(dir);
       if (dsa.has_value())
         dbg << " dsa=" << *dsa;
-      dbg << NL;
 
       // has DSA: done
       if (hasDataSharingAttr) {
@@ -2046,6 +2071,7 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
         if (defaultDSASymbols.size())
           symbol = &MakeAssocSymbol(symbol->name(), *defaultDSASymbols.back(),
               context_.FindScope(dirContext.directiveSource));
+        dbg << " hasDSA" << NL;
         goto next;
       }
 
@@ -2056,18 +2082,26 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
       // XXX allowing any directive, not only parallel, teams amd tasl
       // generating constructs.
       if (dirContext.defaultDSA == semantics::Symbol::Flag::OmpPrivate ||
-          dirContext.defaultDSA == semantics::Symbol::Flag::OmpFirstPrivate) {
+          dirContext.defaultDSA == semantics::Symbol::Flag::OmpFirstPrivate ||
+          dirContext.defaultDSA == semantics::Symbol::Flag::OmpShared) {
         Symbol *hostSymbol = defaultDSASymbols.size() ? defaultDSASymbols.back()
                                                       : &symbol->GetUltimate();
-        defaultDSASymbols.push_back(
-            DeclarePrivateAccessEntity(*hostSymbol, dirContext.defaultDSA,
-                context_.FindScope(dirContext.directiveSource)));
+        if (dirContext.defaultDSA == semantics::Symbol::Flag::OmpShared)
+          defaultDSASymbols.push_back(
+              DeclareSharedAccessEntity(*hostSymbol, dirContext.defaultDSA,
+                  context_.FindScope(dirContext.directiveSource)));
+        else
+          defaultDSASymbols.push_back(
+              DeclarePrivateAccessEntity(*hostSymbol, dirContext.defaultDSA,
+                  context_.FindScope(dirContext.directiveSource)));
         dsa = dirContext.defaultDSA;
-        dbg << "1: " << *dsa << NL;
+        dbg << " 1: " << *dsa << NL;
       }
       // (2) parallel -> shared
-      // else if (llvm::omp::allParallelSet.test(dirContext.directive))
-      //  ;
+      else if (llvm::omp::allParallelSet.test(dirContext.directive)) {
+        dsa = Symbol::Flag::OmpShared;
+        dbg << " 2: " << *dsa << NL;
+      }
       // (3) use enclosing ctx for non-task generating constructs only
       //     (non-default cases already handled above)
       else if (!taskGenDir && !targetDir && defaultDSASymbols.size()) {
@@ -2079,23 +2113,25 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
           dsa = Symbol::Flag::OmpPrivate;
         } else if (flags.test(Symbol::Flag::OmpFirstPrivate)) {
           dsa = Symbol::Flag::OmpFirstPrivate;
+        } else if (flags.test(Symbol::Flag::OmpShared)) {
+          dsa = Symbol::Flag::OmpShared;
         }
-        dbg << "3: " << *dsa << NL;
+        dbg << " 3: " << *dsa << NL;
       }
       // (4) target -> firstprivate
       // else if (targetDir) { }
       // TODO (5) orphaned taskgen dummy args -> firstprivate
       else if (taskGenDir) {
         // (6) check if taskgen is shared in enclosing context
-        dbg << "prevDSA=";
+        dbg << " prevDSA=";
         if (prevDSA)
           dbg << *prevDSA;
         else
-          dbg << "null";
+          dbg << " null";
         dbg << NL;
         if (prevDSA && !privateDataSharingAttributeFlags.test(*prevDSA)) {
           dsa = Symbol::Flag::OmpShared;
-          dbg << "6: " << *dsa << NL;
+          dbg << " 6: " << *dsa << NL;
         // (7) firstprivate
         } else {
           dsa = Symbol::Flag::OmpFirstPrivate;
@@ -2104,7 +2140,7 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
               context_.FindScope(dirContext.directiveSource));
           assert(privSym);
           privSym->set(Symbol::Flag::OmpImplicit);
-          dbg << "7: " << *dsa << NL;
+          dbg << " 7: " << *dsa << NL;
         }
       }
 

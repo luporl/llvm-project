@@ -473,8 +473,8 @@ void DataSharingProcessor::insertLastPrivateCompare(mlir::Operation *op) {
       dbg << "nested: " << *sym << NL
 
 #define DUMP_IMPLICIT                                       \
-    for (const auto &sym : symbolsInNestedRegions)          \
-      dbg << "nested: " << *sym << NL
+    for (const auto &sym : implicitSymbols)                 \
+      dbg << "implicit: " << *sym << NL
 
 void DataSharingProcessor::collectSymbols(
     Fortran::semantics::Symbol::Flag flag) {
