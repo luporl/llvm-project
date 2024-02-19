@@ -2037,7 +2037,8 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
       if (found->test(semantics::Symbol::Flag::OmpThreadprivate))
         return;
     }
-    std::vector<Symbol *> defaultDSASymbols;
+
+    Symbol *defaultDSA = nullptr;
     std::optional<Symbol::Flag> prevDSA;
     dbg << "foreach directive" << NL;
     for (int dirDepth{0}; dirDepth < (int)dirContext_.size(); ++dirDepth) {
@@ -2064,11 +2065,11 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
         dbg << " dsa=" << *dsa;
 
       // has DSA: done
+      // This seems to catch PreDetermined symbols, such as loop index
       if (hasDataSharingAttr) {
-        // if outer symbol has default DSA, add new host-assoc symbol
-        // XXX looks wrong, as it seems default shouldn't be "inherited".
-        if (defaultDSASymbols.size())
-          symbol = &MakeAssocSymbol(symbol->name(), *defaultDSASymbols.back(),
+        // propagate default DSA
+        if (defaultDSA)
+          symbol = &MakeAssocSymbol(symbol->name(), *defaultDSA,
               context_.FindScope(dirContext.directiveSource));
         dbg << " hasDSA" << NL;
         goto next;
@@ -2076,23 +2077,21 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
 
       // no DSA
 
-      // use the one from default clause (adds new host-assoc symbol)
-      // handles (1)
-      // XXX allowing any directive, not only parallel, teams amd tasl
-      // generating constructs.
-      if (dirContext.defaultDSA == semantics::Symbol::Flag::OmpPrivate ||
-          dirContext.defaultDSA == semantics::Symbol::Flag::OmpFirstPrivate ||
-          dirContext.defaultDSA == semantics::Symbol::Flag::OmpShared) {
-        Symbol *hostSymbol = defaultDSASymbols.size() ? defaultDSASymbols.back()
-                                                      : &symbol->GetUltimate();
+      // (1) default
+      // XXX allowing any directive, not only parallel, teams and task
+      //     generating constructs.
+      if (dirContext.defaultDSA == Symbol::Flag::OmpPrivate ||
+          dirContext.defaultDSA == Symbol::Flag::OmpFirstPrivate ||
+          dirContext.defaultDSA == Symbol::Flag::OmpShared) {
+        Symbol *hostSymbol = defaultDSA ? defaultDSA : &symbol->GetUltimate();
         if (dirContext.defaultDSA == semantics::Symbol::Flag::OmpShared)
-          defaultDSASymbols.push_back(
+          defaultDSA =
               DeclareSharedAccessEntity(*hostSymbol, dirContext.defaultDSA,
-                  context_.FindScope(dirContext.directiveSource)));
+                  context_.FindScope(dirContext.directiveSource));
         else
-          defaultDSASymbols.push_back(
+          defaultDSA =
               DeclarePrivateAccessEntity(*hostSymbol, dirContext.defaultDSA,
-                  context_.FindScope(dirContext.directiveSource)));
+                  context_.FindScope(dirContext.directiveSource));
         dsa = dirContext.defaultDSA;
         dbg << " 1: " << *dsa << NL;
       }
@@ -2103,11 +2102,12 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
       }
       // (3) use enclosing ctx for non-task generating constructs only
       //     (non-default cases already handled above)
-      else if (!taskGenDir && !targetDir && defaultDSASymbols.size()) {
-        symbol = &MakeAssocSymbol(symbol->name(), *defaultDSASymbols.back(),
+      // XXX enclosing ctx is not always the defaultDSA
+      else if (!taskGenDir && !targetDir && defaultDSA) {
+        symbol = &MakeAssocSymbol(symbol->name(), *defaultDSA,
             context_.FindScope(dirContext.directiveSource));
 
-        Symbol::Flags flags = defaultDSASymbols.back()->flags();
+        Symbol::Flags flags = defaultDSA->flags();
         if (flags.test(Symbol::Flag::OmpPrivate)) {
           dsa = Symbol::Flag::OmpPrivate;
         } else if (flags.test(Symbol::Flag::OmpFirstPrivate)) {
