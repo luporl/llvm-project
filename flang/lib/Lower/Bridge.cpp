@@ -67,6 +67,8 @@
 #include "llvm/Target/TargetMachine.h"
 #include <optional>
 
+#include "flang/lldbg.h"
+
 #define DEBUG_TYPE "flang-lower-bridge"
 
 static llvm::cl::opt<bool> dumpBeforeFir(
@@ -857,17 +859,24 @@ public:
       llvm::SetVector<const Fortran::semantics::Symbol *> &symbolSet,
       Fortran::semantics::Symbol::Flag flag, bool collectSymbols,
       bool checkHostAssociatedSymbols) override final {
+    LLDBG(0);
     auto addToList = [&](const Fortran::semantics::Symbol &sym) {
       std::function<void(const Fortran::semantics::Symbol &, bool)>
           insertSymbols = [&](const Fortran::semantics::Symbol &oriSymbol,
                               bool collectSymbol) {
-            if (collectSymbol && oriSymbol.test(flag))
-              symbolSet.insert(&oriSymbol);
-            else if (checkHostAssociatedSymbols)
+            if (collectSymbol && oriSymbol.test(flag)) {
+              bool ins = symbolSet.insert(&oriSymbol);
+              dbg << "ins=" << ins << " " << oriSymbol << NL;
+              if (ins)
+                dbg << "scope: " << oriSymbol.owner() << NL;
+            } else if (checkHostAssociatedSymbols) {
               if (const auto *details{
                       oriSymbol
-                          .detailsIf<Fortran::semantics::HostAssocDetails>()})
+                          .detailsIf<Fortran::semantics::HostAssocDetails>()}) {
+                dbg << "tryHostAssoc: " << oriSymbol << NL;
                 insertSymbols(details->symbol(), true);
+              }
+            }
           };
       insertSymbols(sym, collectSymbols);
     };

@@ -23,7 +23,6 @@
 #include <map>
 #include <sstream>
 
-#include "flang/Semantics/openmp-directive-sets.h"
 #include "flang/lldbg.h"
 
 template <typename T>
@@ -113,9 +112,6 @@ protected:
   Symbol *DeclarePrivateAccessEntity(
       const parser::Name &, Symbol::Flag, Scope &);
   Symbol *DeclarePrivateAccessEntity(Symbol &, Symbol::Flag, Scope &);
-  Symbol *DeclareSharedAccessEntity(
-      const parser::Name &, Symbol::Flag, Scope &);
-  Symbol *DeclareSharedAccessEntity(Symbol &, Symbol::Flag, Scope &);
   Symbol *DeclareOrMarkOtherAccessEntity(const parser::Name &, Symbol::Flag);
 
   UnorderedSymbolSet dataSharingAttributeObjects_; // on one directive
@@ -790,29 +786,6 @@ Symbol *DirectiveAttributeVisitor<T>::DeclarePrivateAccessEntity(
       // The symbol in copyin clause must be threadprivate entity.
       symbol.set(Symbol::Flag::OmpThreadprivate);
     }
-    return &symbol;
-  } else {
-    object.set(flag);
-    return &object;
-  }
-}
-
-template <typename T>
-Symbol *DirectiveAttributeVisitor<T>::DeclareSharedAccessEntity(
-    const parser::Name &name, Symbol::Flag flag, Scope &scope) {
-  if (!name.symbol) {
-    return nullptr; // not resolved by Name Resolution step, do nothing
-  }
-  name.symbol = DeclareSharedAccessEntity(*name.symbol, flag, scope);
-  return name.symbol;
-}
-
-template <typename T>
-Symbol *DirectiveAttributeVisitor<T>::DeclareSharedAccessEntity(
-    Symbol &object, Symbol::Flag flag, Scope &scope) {
-  if (object.owner() != currScope()) {
-    auto &symbol{MakeAssocSymbol(object.name(), object, scope)};
-    symbol.set(flag);
     return &symbol;
   } else {
     object.set(flag);
@@ -1687,17 +1660,12 @@ void OmpAttributeVisitor::ResolveSeqLoopIndexInParallelOrTaskConstruct(
   }
   // Otherwise find the symbol and make it Private for the loop scope
   auto nextIt = targetIt + 1;
+  // XXX check this for parallel do
   if (targetIt != dirContext_.rbegin())
     targetIt--; // skip parallel/task, to declare new symbol in DO
   if (auto *symbol{ResolveOmp(iv, Symbol::Flag::OmpPrivate, targetIt->scope)}) {
     targetIt = nextIt; // goto outer enclosing
-    symbol->set(Symbol::Flag::OmpShared, false);
     symbol->set(Symbol::Flag::OmpPreDetermined);
-    if (symbol->test(Symbol::Flag::OmpShared)) {
-      llvm::errs() << "LLL: PD1: new: " << *symbol << "\n";
-      llvm::errs() << "LLL: PD1: curScope: " << currScope() << "\n";
-      llvm::errs() << "LLL: PD1: scope: " << targetIt->scope << "\n";
-    }
     iv.symbol = symbol; // adjust the symbol within region
     for (auto it{dirContext_.rbegin()}; it != targetIt; ++it) {
       AddToContextObjectWithDSA(*symbol, Symbol::Flag::OmpPrivate, *it);
@@ -1805,8 +1773,6 @@ void OmpAttributeVisitor::PrivatizeAssociatedLoopIndexAndCheckLoopLevel(
     const parser::Name *iv{GetLoopIndex(*loop)};
     if (iv) {
       if (auto *symbol{ResolveOmp(*iv, ivDSA, currScope())}) {
-        // llvm::errs() << "LLL: PD2: " << *symbol << "\n";
-        symbol->set(Symbol::Flag::OmpShared, false);
         symbol->set(Symbol::Flag::OmpPreDetermined);
         iv->symbol = symbol; // adjust the symbol within region
         AddToContextObjectWithDSA(*symbol, ivDSA);
@@ -2016,13 +1982,14 @@ void OmpAttributeVisitor::Post(const parser::OpenMPAllocatorsConstruct &x) {
   PopContext();
 }
 
+#define OLD   1
+#if OLD == 2
+
 // For OpenMP constructs, check all the data-refs within the constructs
 // and adjust the symbol for each Name if necessary
 void OmpAttributeVisitor::Post(const parser::Name &name) {
-  LLDBG(1);
   auto *symbol{name.symbol};
   if (symbol && !dirContext_.empty() && GetContext().withinConstruct) {
-    // Exclude construct-names
     if (auto *details{symbol->detailsIf<semantics::MiscDetails>()}) {
       if (details->kind() == semantics::MiscDetails::Kind::ConstructName) {
         return;
@@ -2054,7 +2021,85 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
       if (found->test(semantics::Symbol::Flag::OmpThreadprivate))
         return;
     }
+    std::vector<Symbol *> defaultDSASymbols;
+    for (int dirDepth{0}; dirDepth < (int)dirContext_.size(); ++dirDepth) {
+      DirContext &dirContext = dirContext_[dirDepth];
+      bool hasDataSharingAttr{false};
+      for (auto symMap : dirContext.objectWithDSA) {
+        // if the `symbol` already has a data-sharing attribute
+        if (symMap.first->name() == name.symbol->name()) {
+          hasDataSharingAttr = true;
+          break;
+        }
+      }
+      if (hasDataSharingAttr) {
+        if (defaultDSASymbols.size())
+          symbol = &MakeAssocSymbol(symbol->name(), *defaultDSASymbols.back(),
+              context_.FindScope(dirContext.directiveSource));
+        continue;
+      }
 
+      if (dirContext.defaultDSA == semantics::Symbol::Flag::OmpPrivate ||
+          dirContext.defaultDSA == semantics::Symbol::Flag::OmpFirstPrivate) {
+        Symbol *hostSymbol = defaultDSASymbols.size() ? defaultDSASymbols.back()
+                                                      : &symbol->GetUltimate();
+        defaultDSASymbols.push_back(
+            DeclarePrivateAccessEntity(*hostSymbol, dirContext.defaultDSA,
+                context_.FindScope(dirContext.directiveSource)));
+      } else if (defaultDSASymbols.size())
+        symbol = &MakeAssocSymbol(symbol->name(), *defaultDSASymbols.back(),
+            context_.FindScope(dirContext.directiveSource));
+    }
+  } // within OpenMP construct
+}
+
+#else
+
+// For OpenMP constructs, check all the data-refs within the constructs
+// and adjust the symbol for each Name if necessary
+void OmpAttributeVisitor::Post(const parser::Name &name) {
+  LLDBG(1);
+  auto *symbol{name.symbol};
+  // if symbol present within a construct
+  if (symbol && !dirContext_.empty() && GetContext().withinConstruct) {
+    // skip construct-name symbols
+    if (auto *details{symbol->detailsIf<semantics::MiscDetails>()}) {
+      if (details->kind() == semantics::MiscDetails::Kind::ConstructName) {
+        return;
+      }
+    }
+    // !derived !procedure !hasDSA !constant
+    if (!symbol->owner().IsDerivedType() && !IsProcedure(*symbol) &&
+        !IsObjectWithDSA(*symbol) && !IsNamedConstant(*symbol)) {
+      // TODO: create a separate function to go through the rules for
+      //       predetermined, explicitly determined, and implicitly
+      //       determined data-sharing attributes (2.15.1.1).
+      if (Symbol * found{currScope().FindSymbol(name.source)}) {
+        if (symbol != found) {
+          name.symbol = found; // adjust the symbol within region
+          symbol = found;      // update symbol
+        // check default(NONE) semantics
+        } else if (GetContext().defaultDSA == Symbol::Flag::OmpNone &&
+            !symbol->test(Symbol::Flag::OmpThreadprivate) &&
+            // Exclude indices of sequential loops that are privatised in
+            // the scope of the parallel region, and not in this scope.
+            // TODO: check whether this should be caught in IsObjectWithDSA
+            !symbol->test(Symbol::Flag::OmpPrivate)) {
+          context_.Say(name.source,
+              "The DEFAULT(NONE) clause requires that '%s' must be listed in "
+              "a data-sharing attribute clause"_err_en_US,
+              symbol->name());
+        }
+      }
+    }
+
+    // skip threadprivate symbols
+    if (Symbol * found{currScope().FindSymbol(name.source)}) {
+      if (found->test(semantics::Symbol::Flag::OmpThreadprivate))
+        return;
+    }
+
+    // flagsToDSA
     auto flagsToDSA = [](const Symbol::Flags &flags) {
         if (flags.test(Symbol::Flag::OmpPrivate))
           return Symbol::Flag::OmpPrivate;
@@ -2064,13 +2109,21 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
         // assume shared
         return Symbol::Flag::OmpShared;
     };
+    (void)flagsToDSA;
 
     std::optional<Symbol::Flag> prevDSA;
+    dbg << NL;
     dbg << "foreach directive" << NL;
+    (void)prevDSA;
+
+    std::vector<Symbol *> defaultDSASymbols;
+
+    // foreach directive
     for (int dirDepth{0}; dirDepth < (int)dirContext_.size(); ++dirDepth) {
       DirContext &dirContext = dirContext_[dirDepth];
       std::optional<Symbol::Flag> dsa;
       bool hasDataSharingAttr{false};
+
       for (auto symMap : dirContext.objectWithDSA) {
         // if the `symbol` already has a data-sharing attribute
         if (symMap.first->name() == name.symbol->name()) {
@@ -2080,63 +2133,98 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
         }
       }
 
+      // getParentContext
+      auto getParentContext = [&]() -> DirContext * {
+        if (dirDepth == 0)
+          return nullptr;
+        return &dirContext_[dirDepth - 1];
+      };
+      // getParentScope
+      auto getParentScope = [&]() -> Scope * {
+        if (DirContext *parentCtx = getParentContext())
+          return &parentCtx->scope;
+        return nullptr;
+      };
+      // getHostSymbol
       auto getHostSymbol = [&]() {
-        Symbol *hostSymbol;
-        if (dirDepth == 0) {
+        Symbol *hostSymbol = nullptr;
+        if (dirDepth > 0)
+          hostSymbol = getParentScope()->FindSymbol(symbol->name());
+        if (!hostSymbol)
           hostSymbol = &symbol->GetUltimate();
-        } else {
-          DirContext &parentCtx = dirContext_[dirDepth - 1];
-          hostSymbol = parentCtx.scope.FindSymbol(symbol->name());
-          //dbg << NL;
-          //dbg << "parentCtx.scope: " << parentCtx.scope << NL;
-          //dbg << "symbol: " << *symbol << NL;
-        }
-        assert(hostSymbol && "host symbol not found");
         return hostSymbol;
       };
       (void)getHostSymbol;
+      // defaultAssoc
+      auto defaultAssoc = [&]() {
+        if (defaultDSASymbols.size())
+          symbol = &MakeAssocSymbol(symbol->name(), *defaultDSASymbols.back(),
+              context_.FindScope(dirContext.directiveSource));
+      };
+      (void)defaultAssoc;
 
-      Symbol *curSym = currScope().FindSymbol(name.source);
+      // start:
+      Scope *curScope = &dirContext.scope;
+      Symbol *curSym = [&]() -> Symbol * {
+        if (auto it = curScope->find(name.source); it != curScope->end())
+          return &*it->second;
+        return nullptr;
+      }();
+
       auto dir = dirContext.directive;
       bool taskGenDir = llvm::omp::taskGeneratingSet.test(dir);
       bool targetDir = llvm::omp::allTargetSet.test(dir);
       (void)taskGenDir;
       (void)targetDir;
+      // dbg print: sym, dir, dsa, scope
       dbg << "sym=" << symbol->name() << " dir=" << dirDepth << ": "
           << getOpenMPDirectiveName(dir);
       if (dsa.has_value())
         dbg << " dsa=" << *dsa;
+      dbg << " scope: " << curScope << " " << *curScope << NL;
+      // curSym
+      if (curSym)
+        dbg << "curSym: " << *curSym << NL;
+      else
+        dbg << "curSym: NULL" << NL;
 
       // has DSA: done
       // This seems to catch PreDetermined symbols, such as loop indexes, and
       // explicitly determined symbols, such as private(x).
-      if (hasDataSharingAttr ||
-          (curSym && curSym->test(Symbol::Flag::OmpPreDetermined))) {
-        if (!hasDataSharingAttr && curSym && curSym->test(Symbol::Flag::OmpPreDetermined))
-          dsa = flagsToDSA(curSym->flags());
-        dbg << " hasDSA " << *dsa << NL;
-        if (curSym)
-          curSym->dump();
+      // bool curSymPD = (curSym && curSym->test(Symbol::Flag::OmpPreDetermined));
+
+      if (hasDataSharingAttr) {
+#if OLD
+        if (defaultDSASymbols.size())
+          symbol = &MakeAssocSymbol(symbol->name(), *defaultDSASymbols.back(),
+              context_.FindScope(dirContext.directiveSource));
+#endif
+        dbg << " 0: hasDSA " << *dsa << NL;
         goto next;
       }
+      assert(!curSym ||
+        !curSym->test(Symbol::Flag::OmpShared) ||
+        !curSym->test(Symbol::Flag::OmpPrivate) ||
+        !curSym->test(Symbol::Flag::OmpFirstPrivate) ||
+        !curSym->test(Symbol::Flag::OmpLastPrivate) ||
+        !curSym->test(Symbol::Flag::OmpPreDetermined));
 
       // Implicitly determined DSA
       // OpenMP 5.2 spec - subclause 5.1.1 - Variables Referenced in a Construct
 
       // (1) default
       if (dirContext.defaultDSA == Symbol::Flag::OmpPrivate ||
-          dirContext.defaultDSA == Symbol::Flag::OmpFirstPrivate ||
-          dirContext.defaultDSA == Symbol::Flag::OmpShared) {
-        // Allowed only on parallel, teams and task generating constructs.
+          dirContext.defaultDSA == Symbol::Flag::OmpFirstPrivate
+          /*|| dirContext.defaultDSA == Symbol::Flag::OmpShared*/) {
+        // Allowed only with parallel, teams and task generating constructs.
         assert(llvm::omp::allParallelSet.test(dirContext.directive) ||
             llvm::omp::allTeamsSet.test(dirContext.directive) || taskGenDir);
-        Symbol *hostSymbol = getHostSymbol();
-        if (dirContext.defaultDSA == semantics::Symbol::Flag::OmpShared)
-            symbol = DeclareSharedAccessEntity(*hostSymbol, dirContext.defaultDSA,
-                context_.FindScope(dirContext.directiveSource));
-        else
-            symbol = DeclarePrivateAccessEntity(*hostSymbol, dirContext.defaultDSA,
-                context_.FindScope(dirContext.directiveSource));
+
+        if (dirContext.defaultDSA != Symbol::Flag::OmpShared) {
+          defaultDSASymbols.push_back(
+              DeclarePrivateAccessEntity(*getHostSymbol(), dirContext.defaultDSA,
+                  context_.FindScope(dirContext.directiveSource)));
+        }
         dsa = dirContext.defaultDSA;
         dbg << " 1: " << *dsa << NL;
       }
@@ -2144,29 +2232,15 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
       // (2) parallel -> shared (parallel do, etc...)
       // XXX allParallelSet may not be correct
       else if (llvm::omp::allParallelSet.test(dirContext.directive)) {
-        // skip if this symbol was already declared in this scope
-        // e.g. PreDetermined, second pass
-        if (curSym && curSym->scope() == &dirContext.scope) {
-          dsa = flagsToDSA(curSym->flags());
-          dbg << " 2 (skipped): " << *dsa << NL;
-          curSym->dump();
-          goto next;
-        }
-
+        defaultAssoc();
         dsa = Symbol::Flag::OmpShared;
-        // needed to avoid (3) getting a private symbol, for instance
-        symbol = DeclareSharedAccessEntity(*getHostSymbol(), *dsa,
-            context_.FindScope(dirContext.directiveSource));
         dbg << " 2: " << *dsa << NL;
-        symbol->dump();
       }
 
       // (3) for non-task generating constructs, use the variable from the
       //     enclosing ctx.
       else if (!taskGenDir && !targetDir) {
-        // MakeAssoc to distinguish this symbol from that used in another
-        // directive (used in semantic checks)
-
+        defaultAssoc();
         dsa = flagsToDSA(getHostSymbol()->flags());
         dbg << " 3: " << *dsa << NL;
       }
@@ -2175,14 +2249,12 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
       // XXX check not handled by map part
       else if (targetDir) {
         dsa = Symbol::Flag::OmpFirstPrivate;
-        dbg << " " << *symbol;
-        //DeclarePrivateAccessEntity(symbol->GetUltimate(), *dsa,
-        //    context_.FindScope(dirContext.directiveSource));
         dbg << " 4: " << *dsa << NL;
       }
 
-      // TODO (5) orphaned taskgen dummy args -> firstprivate
       else if (taskGenDir) {
+      // TODO (5) orphaned taskgen dummy args -> firstprivate
+
 #if 0
         // (6) check if taskgen is shared in enclosing context
         dbg << " prevDSA=";
@@ -2215,6 +2287,8 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
     }
   } // within OpenMP construct
 }
+
+#endif // OLD == 2
 
 Symbol *OmpAttributeVisitor::ResolveName(const parser::Name *name) {
   if (auto *resolvedSymbol{
@@ -2451,15 +2525,8 @@ void OmpAttributeVisitor::ResolveOmpObject(
 Symbol *OmpAttributeVisitor::ResolveOmp(
     const parser::Name &name, Symbol::Flag ompFlag, Scope &scope) {
   if (ompFlagsRequireNewSymbol.test(ompFlag)) {
-    Symbol *osym = name.symbol;
-    Symbol *nsym = DeclarePrivateAccessEntity(name, ompFlag, scope);
-    if (osym != nsym)
-      llvm::errs() << "LLL: ResolveOmp(new)\n";
-    else
-      llvm::errs() << "LLL: ResolveOmp(old)\n";
-    return nsym;
+    return DeclarePrivateAccessEntity(name, ompFlag, scope);
   } else {
-    llvm::errs() << "LLL: ResolveOmp(old)\n";
     return DeclareOrMarkOtherAccessEntity(name, ompFlag);
   }
 }
