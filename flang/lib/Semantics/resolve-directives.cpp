@@ -2099,6 +2099,13 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
         return;
     }
 
+    // vars //
+    Symbol *defaultDSASymbol = nullptr;
+    std::optional<Symbol::Flag> prevDSA;
+    (void)prevDSA;
+
+    //--- lambdas ---//
+
     // flagsToDSA
     auto flagsToDSA = [](const Symbol::Flags &flags) {
         if (flags.test(Symbol::Flag::OmpFirstPrivate))
@@ -2113,36 +2120,131 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
     };
     (void)flagsToDSA;
 
+    // getDSA
+    auto getDSA = [&](DirContext &ctx) -> std::optional<Symbol::Flag> {
+      for (auto symMap : ctx.objectWithDSA)
+        // if the `symbol` already has a data-sharing attribute
+        if (symMap.first->name() == name.symbol->name())
+          return symMap.second;
+      return std::nullopt;
+    };
+    (void)getDSA;
+
+    // getParentContext
+    auto getParentContext = [&](int i) -> DirContext * {
+      if (i == 0)
+        return nullptr;
+      return &dirContext_[i - 1];
+    };
+
+    // getParentScope
+    auto getParentScope = [&](int i) -> Scope * {
+      if (DirContext *parentCtx = getParentContext(i))
+        return &parentCtx->scope;
+      return nullptr;
+    };
+
+    // getParentSymbol
+    auto getParentSymbol = [&](int i) -> Symbol * {
+      Scope *parentScope = getParentScope(i);
+      if (!parentScope)
+        return nullptr;
+      if (auto it = parentScope->find(name.source); it != parentScope->end())
+        return &*it->second;
+      return nullptr;
+    };
+    (void)getParentSymbol;
+
+    // getParentDSA
+    // XXX may have issues with PreDetermined, if added after Post()
+    std::function<std::optional<Symbol::Flag>(int)> getParentDSA;
+    getParentDSA = [&](int i) -> std::optional<Symbol::Flag> {
+      auto dir = dirContext_[i].directive;
+      bool taskGenDir = llvm::omp::taskGeneratingSet.test(dir);
+      bool targetDir = llvm::omp::allTargetSet.test(dir);
+
+      dbg << "sym=" << symbol->name() << " ";
+
+      assert(i >= 0);
+      // 1) assume shared if no parent ctx exists
+      DirContext *parentCtx = getParentContext(i);
+      if (!parentCtx) {
+        dbg << "GPD#" << i << ": 1) null" << NL;
+        return std::nullopt;
+      }
+
+      // 2) parent DSA if explicit
+      if (std::optional<Symbol::Flag> parentDSA = getDSA(*parentCtx)) {
+        dbg << "GPD#" << i << ": 2) " << *parentDSA << NL;
+        return parentDSA;
+      }
+
+      // 3) default(shared)
+      if (parentCtx->defaultDSA == Symbol::Flag::OmpShared) {
+        dbg << "GPD#" << i << ": 3) " << Symbol::Flag::OmpShared << NL;
+        return Symbol::Flag::OmpShared;
+      }
+      // - default(*private) - symbol will be present, no need to check
+
+      // 4) parent symbol DSA, if it exists
+      if (Symbol *parentSymbol = getParentSymbol(i)) {
+        dbg << "GPD#" << i << ": 4) " << flagsToDSA(parentSymbol->flags()) << NL;
+        return flagsToDSA(parentSymbol->flags());
+      }
+
+      // 5) absent symbol, this means shared for some directives:
+      // - parallel
+      // - teams
+      // - taskgen
+      if (llvm::omp::allParallelSet.test(parentCtx->directive) ||
+          llvm::omp::allTeamsSet.test(parentCtx->directive) ||
+          taskGenDir) {
+        dbg << "GPD#" << i << ": 5) " << Symbol::Flag::OmpShared << NL;
+        return Symbol::Flag::OmpShared;
+      }
+
+      // 6) !taskGenDir && !targetDir - enclosing context
+      if (!taskGenDir && !targetDir) {
+        auto ret = getParentDSA(i - 1);
+        if (!ret)
+          dbg << "GPD#" << i << ": 6) null" << NL;
+        else
+          dbg << "GPD#" << i << ": 6) " << *ret << NL;
+        return ret;
+      }
+
+      // TODO 7) targetDir
+      if (targetDir) {
+        auto ret = getParentDSA(i - 1);
+        if (!ret)
+          dbg << "GPD#" << i << ": 7) null" << NL;
+        else
+          dbg << "GPD#" << i << ": 7) " << *ret << NL;
+        return ret;
+      }
+
+      llvm_unreachable("getParentDSA failed");
+      return std::nullopt;
+    };
+    (void)getParentDSA;
+
+    // curDSA
+    auto curDSA = [&](const std::optional<Symbol::Flag> &dsa) {
+      return dsa ? dsa : Symbol::Flag::OmpShared;
+    };
+    (void)curDSA;
+
+    //--- end lambdas ---//
+
     dbg << NL;
     dbg << "foreach directive" << NL;
-
-    std::vector<Symbol *> defaultDSASymbols;
 
     // foreach directive
     for (int dirDepth{0}; dirDepth < (int)dirContext_.size(); ++dirDepth) {
       DirContext &dirContext = dirContext_[dirDepth];
 
-      // getDSA
-      auto getDSA = [&](DirContext &ctx) -> std::optional<Symbol::Flag> {
-        for (auto symMap : ctx.objectWithDSA)
-          // if the `symbol` already has a data-sharing attribute
-          if (symMap.first->name() == name.symbol->name())
-            return symMap.second;
-        return std::nullopt;
-      };
-      (void)getDSA;
-      // getParentContext
-      auto getParentContext = [&](int i) -> DirContext * {
-        if (i == 0)
-          return nullptr;
-        return &dirContext_[i - 1];
-      };
-      // getParentScope
-      auto getParentScope = [&](int i) -> Scope * {
-        if (DirContext *parentCtx = getParentContext(i))
-          return &parentCtx->scope;
-        return nullptr;
-      };
+      //--- lambdas ---//
+
       // getHostSymbol
       auto getHostSymbol = [&]() {
         Symbol *hostSymbol = nullptr;
@@ -2153,97 +2255,18 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
         return hostSymbol;
       };
       (void)getHostSymbol;
+
       // defaultAssoc
       auto defaultAssoc = [&]() {
-        if (defaultDSASymbols.size())
-          symbol = &MakeAssocSymbol(symbol->name(), *defaultDSASymbols.back(),
+        if (defaultDSASymbol)
+          symbol = &MakeAssocSymbol(symbol->name(), *defaultDSASymbol,
               context_.FindScope(dirContext.directiveSource));
       };
       (void)defaultAssoc;
-      // getParentSymbol
-      auto getParentSymbol = [&](int i) -> Symbol * {
-        Scope *parentScope = getParentScope(i);
-        if (!parentScope)
-          return nullptr;
-        if (auto it = parentScope->find(name.source); it != parentScope->end())
-          return &*it->second;
-        return nullptr;
-      };
-      (void)getParentSymbol;
-      // getParentDSA
-      // XXX may have issues with PreDetermined, if added after Post()
-      std::function<std::optional<Symbol::Flag>(int)> getParentDSA;
-      getParentDSA = [&](int i) -> std::optional<Symbol::Flag> {
-        auto dir = dirContext_[i].directive;
-        bool taskGenDir = llvm::omp::taskGeneratingSet.test(dir);
-        bool targetDir = llvm::omp::allTargetSet.test(dir);
 
-        dbg << "sym=" << symbol->name() << " ";
+      //--- end lambdas ---//
 
-        assert(i >= 0);
-        // 1) assume shared if no parent ctx exists
-        DirContext *parentCtx = getParentContext(i);
-        if (!parentCtx) {
-          dbg << "GPD#" << i << ": 1) null" << NL;
-          return std::nullopt;
-        }
-
-        // 2) parent DSA if explicit
-        if (std::optional<Symbol::Flag> parentDSA = getDSA(*parentCtx)) {
-          dbg << "GPD#" << i << ": 2) " << *parentDSA << NL;
-          return parentDSA;
-        }
-
-        // 3) default(shared)
-        if (parentCtx->defaultDSA == Symbol::Flag::OmpShared) {
-          dbg << "GPD#" << i << ": 3) " << Symbol::Flag::OmpShared << NL;
-          return Symbol::Flag::OmpShared;
-        }
-        // - default(*private) - symbol will be present, no need to check
-
-        // 4) parent symbol DSA, if it exists
-        if (Symbol *parentSymbol = getParentSymbol(i)) {
-          dbg << "GPD#" << i << ": 4) " << flagsToDSA(parentSymbol->flags()) << NL;
-          return flagsToDSA(parentSymbol->flags());
-        }
-
-        // 5) absent symbol, this means shared for some directives:
-        // - parallel
-        // - teams
-        // - taskgen
-        if (llvm::omp::allParallelSet.test(parentCtx->directive) ||
-            llvm::omp::allTeamsSet.test(parentCtx->directive) ||
-            taskGenDir) {
-          dbg << "GPD#" << i << ": 5) " << Symbol::Flag::OmpShared << NL;
-          return Symbol::Flag::OmpShared;
-        }
-
-        // 6) !taskGenDir && !targetDir - enclosing context
-        if (!taskGenDir && !targetDir) {
-          auto ret = getParentDSA(i - 1);
-          if (!ret)
-            dbg << "GPD#" << i << ": 6) null" << NL;
-          else
-            dbg << "GPD#" << i << ": 6) " << *ret << NL;
-          return ret;
-        }
-
-        // TODO 7) targetDir
-        if (targetDir) {
-          auto ret = getParentDSA(i - 1);
-          if (!ret)
-            dbg << "GPD#" << i << ": 7) null" << NL;
-          else
-            dbg << "GPD#" << i << ": 7) " << *ret << NL;
-          return ret;
-        }
-
-        llvm_unreachable("getParentDSA failed");
-        return std::nullopt;
-      };
-      (void)getParentDSA;
-
-      // start:
+      // vars
       auto dir = dirContext.directive;
       bool taskGenDir = llvm::omp::taskGeneratingSet.test(dir);
       bool targetDir = llvm::omp::allTargetSet.test(dir);
@@ -2260,31 +2283,31 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
       }();
 
       // dbg print: sym, dir, dsa, scope
-      dbg << "sym=" << symbol->name() << " dir=" << dirDepth << ": "
-          << getOpenMPDirectiveName(dir);
-      if (dsa.has_value())
-        dbg << " dsa=" << *dsa;
-      dbg << " scope: " << curScope << " " << *curScope << NL;
+      // dbg << " scope: " << curScope /* << " " << *curScope */ << NL;
+      /*
       // curSym
       if (curSym)
         dbg << "curSym: " << *curSym << NL;
       else
         dbg << "curSym: NULL" << NL;
+      */
 
       // has DSA: done
       // This seems to catch PreDetermined symbols, such as loop indexes, and
       // explicitly determined symbols, such as private(x).
-      // bool curSymPD = (curSym && curSym->test(Symbol::Flag::OmpPreDetermined));
 
+      dbg << symbol->name() << ": " << getOpenMPDirectiveName(dir)
+          << "(" << dirDepth << "): ";
       if (hasDataSharingAttr) {
-#if OLD
-        if (defaultDSASymbols.size())
-          symbol = &MakeAssocSymbol(symbol->name(), *defaultDSASymbols.back(),
-              context_.FindScope(dirContext.directiveSource));
-#endif
-        dbg << " 0: hasDSA " << *dsa << NL;
+        dbg << " 0: " << *dsa << NL;
+        // Some cases, e.g. shared(x) nested inside default(private),
+        // need a new symbol, with no flags, to avoid the symbol from
+        // being excluded from the parent context.
+        defaultAssoc();
+        prevDSA = curDSA(dsa);
         continue;
       }
+      // XXX STOPPED HERE
       assert(!curSym ||
         !curSym->test(Symbol::Flag::OmpShared) ||
         !curSym->test(Symbol::Flag::OmpPrivate) ||
@@ -2303,11 +2326,13 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
         assert(llvm::omp::allParallelSet.test(dirContext.directive) ||
             llvm::omp::allTeamsSet.test(dirContext.directive) || taskGenDir);
 
-        if (dirContext.defaultDSA != Symbol::Flag::OmpShared) {
-          defaultDSASymbols.push_back(
+        if (dirContext.defaultDSA != Symbol::Flag::OmpShared)
+          defaultDSASymbol =
               DeclarePrivateAccessEntity(*getHostSymbol(), dirContext.defaultDSA,
-                  context_.FindScope(dirContext.directiveSource)));
-        } else
+                  context_.FindScope(dirContext.directiveSource));
+        else
+          // needed to avoid excluding symbols from parent in a nested
+          // parallel default(shared)
           defaultAssoc();
         dsa = dirContext.defaultDSA;
         dbg << " 1: " << *dsa << NL;
@@ -2316,7 +2341,8 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
       // (2) parallel -> shared (parallel do, etc...)
       // XXX allParallelSet may not be correct
       else if (llvm::omp::allParallelSet.test(dirContext.directive)) {
-        defaultAssoc();
+        // "shares" the symbol inherited from parent scope
+        // TODO test if it behaves correctly with collectSymbols
         dsa = Symbol::Flag::OmpShared;
         dbg << " 2: " << *dsa << NL;
       }
@@ -2324,6 +2350,9 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
       // (3) for non-task generating constructs, use the variable from the
       //     enclosing ctx.
       else if (!taskGenDir && !targetDir) {
+        // if no assoc is created, collectSymbols will collect the parent's
+        // symbol when collecting nested symbols, which will then be excluded
+        // from defaultSymbols, which is wrong.
         defaultAssoc();
         dsa = flagsToDSA(getHostSymbol()->flags());
         dbg << " 3: " << *dsa << NL;
@@ -2356,6 +2385,7 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
       }
 
       // else: DSA == shared
+      prevDSA = curDSA(dsa);
     }
   } // within OpenMP construct
 }

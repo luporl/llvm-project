@@ -165,14 +165,15 @@ class DataSharingProcessor {
   Fortran::lower::pft::Evaluation &eval;
 
   bool needBarrier();
-  void collectSymbols(Fortran::semantics::Symbol::Flag flag);
+  void collectSymbols(const Fortran::semantics::SemanticsContext &semaCtx,
+      Fortran::semantics::Symbol::Flag flag);
   void collectOmpObjectListSymbol(
       const Fortran::parser::OmpObjectList &ompObjectList,
       llvm::SetVector<const Fortran::semantics::Symbol *> &symbolSet);
   void collectSymbolsForPrivatization();
   void insertBarrier();
-  void collectDefaultSymbols();
-  void collectImplicitSymbols();
+  void collectDefaultSymbols(const Fortran::semantics::SemanticsContext &semaCtx);
+  void collectImplicitSymbols(const Fortran::semantics::SemanticsContext &semaCtx);
   void privatize();
   bool isPrivatizable(const Fortran::semantics::Symbol &sym) const;
   void defaultPrivatize();
@@ -203,7 +204,7 @@ public:
   // Step2 performs the copying for lastprivates and requires knowledge of the
   // MLIR operation to insert the last private update. Step2 adds
   // dealocation code as well.
-  void processStep1();
+  void processStep1(Fortran::semantics::SemanticsContext &semaCtx);
   void processStep2(mlir::Operation *op, bool isLoop);
 
   void setLoopIV(mlir::Value iv) {
@@ -212,10 +213,10 @@ public:
   }
 };
 
-void DataSharingProcessor::processStep1() {
+void DataSharingProcessor::processStep1(Fortran::semantics::SemanticsContext &semaCtx) {
   collectSymbolsForPrivatization();
-  collectDefaultSymbols();
-  collectImplicitSymbols();
+  collectDefaultSymbols(semaCtx);
+  collectImplicitSymbols(semaCtx);
   privatize();
   defaultPrivatize();
   implicitPrivatize();
@@ -468,6 +469,11 @@ void DataSharingProcessor::insertLastPrivateCompare(mlir::Operation *op) {
   for (const auto &sym : defaultSymbols)                                       \
   dbg << "default: " << *sym << NL
 
+#define DUMP_XDEFAULT                                                          \
+  for (const auto &sym : defaultSymbols)                                       \
+    if (!symbolsInNestedRegions.contains(sym))                                 \
+      dbg << "xdefault: " << *sym << NL
+
 #define DUMP_NESTED                                                            \
   for (const auto &sym : symbolsInNestedRegions)                               \
   dbg << "nested: " << *sym << NL
@@ -477,9 +483,14 @@ void DataSharingProcessor::insertLastPrivateCompare(mlir::Operation *op) {
   dbg << "implicit: " << *sym << NL
 
 void DataSharingProcessor::collectSymbols(
+    const Fortran::semantics::SemanticsContext &semaCtx,
     Fortran::semantics::Symbol::Flag flag) {
   LLDBG(1);
 
+#define OLD   0
+#if OLD
+  // collectHostAssociatedSymbols=true is needed by nested directives
+  // e.g.: nested shared(z)
   converter.collectSymbolSet(eval, defaultSymbols, flag,
                              /*collectSymbols=*/true,
                              /*collectHostAssociatedSymbols=*/true);
@@ -499,9 +510,53 @@ void DataSharingProcessor::collectSymbols(
       DUMP_NESTED;
     }
   }
+  DUMP_XDEFAULT;
+
+#else
+  assert(!opClauseList.source.empty());
+  const Fortran::semantics::Scope &curScope = semaCtx.FindScope(opClauseList.source);
+  llvm::SetVector<const Fortran::semantics::Scope *> nestedScopes;
+  // find nested scopes
+  std::function<void(const Fortran::semantics::Scope *)> findNestedScopes =
+  [&](const Fortran::semantics::Scope *scope) {
+    nestedScopes.insert(scope);
+    for (const Fortran::semantics::Scope &child : scope->children())
+      findNestedScopes(&child);
+  };
+  findNestedScopes(&curScope);
+
+  llvm::SetVector<const Fortran::semantics::Symbol *> allSymbols;
+  converter.collectSymbolSet(eval, allSymbols, flag,
+                             /*collectSymbols=*/true,
+                             /*collectHostAssociatedSymbols=*/true);
+  // filter-out symbols that don't belong to current scope
+  for (const auto &sym : allSymbols)
+    if (nestedScopes.contains(&sym->owner()))
+      defaultSymbols.insert(sym);
+    else
+      dbg << "filter-out: " << sym->name() << NL;
+
+  dbg << NL;
+  dbg << "eval:\n";
+  DBG(eval.dump());
+  dbg << NL;
+  DUMP_DEFAULT;
+  for (Fortran::lower::pft::Evaluation &e : eval.getNestedEvaluations()) {
+    if (e.hasNestedEvaluations() && !e.isConstruct()) {
+      dbg << "nested:\n";
+      DBG(e.dump());
+      dbg << NL;
+      converter.collectSymbolSet(e, symbolsInNestedRegions, flag,
+                                 /*collectSymbols=*/true,
+                                 /*collectHostAssociatedSymbols=*/false);
+      DUMP_NESTED;
+    }
+  }
+  DUMP_XDEFAULT;
+#endif
 }
 
-void DataSharingProcessor::collectDefaultSymbols() {
+void DataSharingProcessor::collectDefaultSymbols(const Fortran::semantics::SemanticsContext &semaCtx) {
   LLDBG(1);
 
   for (const Fortran::parser::OmpClause &clause : opClauseList.v) {
@@ -509,10 +564,10 @@ void DataSharingProcessor::collectDefaultSymbols() {
             std::get_if<Fortran::parser::OmpClause::Default>(&clause.u)) {
       if (defaultClause->v.v ==
           Fortran::parser::OmpDefaultClause::Type::Private)
-        collectSymbols(Fortran::semantics::Symbol::Flag::OmpPrivate);
+        collectSymbols(semaCtx, Fortran::semantics::Symbol::Flag::OmpPrivate);
       else if (defaultClause->v.v ==
                Fortran::parser::OmpDefaultClause::Type::Firstprivate)
-        collectSymbols(Fortran::semantics::Symbol::Flag::OmpFirstPrivate);
+        collectSymbols(semaCtx, Fortran::semantics::Symbol::Flag::OmpFirstPrivate);
     }
   }
 
@@ -520,7 +575,7 @@ void DataSharingProcessor::collectDefaultSymbols() {
   DUMP_NESTED;
 }
 
-void DataSharingProcessor::collectImplicitSymbols() {
+void DataSharingProcessor::collectImplicitSymbols(const Fortran::semantics::SemanticsContext &semaCtx) {
   LLDBG(1);
 
 #if 1
@@ -2464,7 +2519,7 @@ static void createBodyOfOp(Op &op, OpWithBodyGenInfo &info) {
   if (privatize) {
     if (!info.dsp) {
       tempDsp.emplace(info.converter, *info.clauses, info.eval);
-      tempDsp->processStep1();
+      tempDsp->processStep1(info.semaCtx);
     }
   }
 
@@ -3479,7 +3534,7 @@ createSimdLoop(Fortran::lower::AbstractConverter &converter,
                mlir::Location loc) {
   fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
   DataSharingProcessor dsp(converter, loopOpClauseList, eval);
-  dsp.processStep1();
+  dsp.processStep1(semaCtx);
 
   Fortran::lower::StatementContext stmtCtx;
   mlir::Value scheduleChunkClauseOperand, ifClauseOperand;
@@ -3539,7 +3594,7 @@ static void createWsLoop(Fortran::lower::AbstractConverter &converter,
                          mlir::Location loc) {
   fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
   DataSharingProcessor dsp(converter, beginClauseList, eval);
-  dsp.processStep1();
+  dsp.processStep1(semaCtx);
 
   Fortran::lower::StatementContext stmtCtx;
   mlir::Value scheduleChunkClauseOperand;

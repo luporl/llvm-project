@@ -861,24 +861,25 @@ public:
       bool checkHostAssociatedSymbols) override final {
     LLDBG(0);
     auto addToList = [&](const Fortran::semantics::Symbol &sym) {
-      std::function<void(const Fortran::semantics::Symbol &, bool)>
+      std::function<void(const Fortran::semantics::Symbol &, bool, bool)>
           insertSymbols = [&](const Fortran::semantics::Symbol &oriSymbol,
-                              bool collectSymbol) {
+                              bool collectSymbol, bool hostAssoc) {
             if (collectSymbol && oriSymbol.test(flag)) {
               bool ins = symbolSet.insert(&oriSymbol);
-              dbg << "ins=" << ins << " " << oriSymbol << NL;
+              dbg << oriSymbol << " ins=" << ins << " scope=" << &oriSymbol.owner()
+                  << " hostAssoc=" << hostAssoc << NL;
               if (ins)
-                dbg << "scope: " << oriSymbol.owner() << NL;
+                dbg << "scope: " << &oriSymbol.owner() << " " << oriSymbol.owner() << NL;
             } else if (checkHostAssociatedSymbols) {
               if (const auto *details{
                       oriSymbol
                           .detailsIf<Fortran::semantics::HostAssocDetails>()}) {
-                dbg << "tryHostAssoc: " << oriSymbol << NL;
-                insertSymbols(details->symbol(), true);
+                // dbg << "tryHostAssoc: " << oriSymbol << NL;
+                insertSymbols(details->symbol(), true, true);
               }
             }
           };
-      insertSymbols(sym, collectSymbols);
+      insertSymbols(sym, collectSymbols, false);
     };
     Fortran::lower::pft::visitAllSymbols(eval, addToList);
   }
