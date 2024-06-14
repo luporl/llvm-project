@@ -19,6 +19,7 @@
 #include "flang/Parser/parse-tree.h"
 #include "flang/Parser/tools.h"
 #include "flang/Semantics/expression.h"
+#include "flang/Semantics/tools.h"
 #include <list>
 #include <map>
 #include <sstream>
@@ -2540,6 +2541,32 @@ void ResolveOmpTopLevelParts(
   });
 }
 
+static bool IsSymbolInCommonBlock(const Symbol &symbol) {
+  // If there are many symbols in common blocks, going through them all can be
+  // slow. A possible optimization is to add an OmpInCommonBlock flag to
+  // Symbol, to make it possible to quickly test if a given symbol is in a
+  // common block.
+  for (const auto &cb : symbol.owner().commonBlocks()) {
+    if (IsCommonBlockContaining(cb.second.get(), symbol)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool IsSymbolPredeterminedAsPrivate(const Symbol &symbol) {
+  switch (symbol.owner().kind()) {
+  case Scope::Kind::MainProgram:
+  case Scope::Kind::Subprogram:
+  case Scope::Kind::BlockConstruct:
+    return !symbol.attrs().test(Attr::SAVE) &&
+        !symbol.attrs().test(Attr::PARAMETER) && !IsAssumedShape(symbol) &&
+        !IsSymbolInCommonBlock(symbol);
+  default:
+    return false;
+  }
+}
+
 void OmpAttributeVisitor::CheckDataCopyingClause(
     const parser::Name &name, const Symbol &symbol, Symbol::Flag ompFlag) {
   const auto *checkSymbol{&symbol};
@@ -2566,75 +2593,23 @@ void OmpAttributeVisitor::CheckDataCopyingClause(
           "COPYPRIVATE variable '%s' may not appear on a PRIVATE or "
           "FIRSTPRIVATE clause on a SINGLE construct"_err_en_US,
           symbol.name());
-    } else {
+    } else if (!checkSymbol->test(Symbol::Flag::OmpThreadprivate) &&
+        !(HasSymbolInEnclosingScope(symbol, currScope()) &&
+            (symbol.test(Symbol::Flag::OmpPrivate) ||
+                symbol.test(Symbol::Flag::OmpFirstPrivate)))) {
       // List of items/objects that can appear in a 'copyprivate' clause must be
       // either 'private' or 'threadprivate' in enclosing context.
-      if (!checkSymbol->test(Symbol::Flag::OmpThreadprivate) &&
-          !(HasSymbolInEnclosingScope(symbol, currScope()) &&
-              (symbol.test(Symbol::Flag::OmpPrivate) ||
-                  symbol.test(Symbol::Flag::OmpFirstPrivate)))) {
-
-        // LLL
-        llvm::errs() << "\nLLL: symbol: " << symbol << '\n';
-        #if 0
-        llvm::errs() << "LLL: scope: " << currScope() << '\n';
-        llvm::errs() << "LLL: cur_scope_syms: \n";
-        for (const auto &sym : currScope().GetSymbols())
-          llvm::errs() << "LLL: sym: " << *sym << '\n';
-        llvm::errs() << "LLL: HasSymbolInEnclosingScope: " << HasSymbolInEnclosingScope(symbol, currScope()) << '\n';
-        if (HasSymbolInEnclosingScope(symbol, currScope())) {
-          llvm::errs() << "LLL: encScope: " << currScope().parent() << '\n';
-          llvm::errs() << "LLL: enc_scope_syms: \n";
-          for (const auto &sym : currScope().parent().GetSymbols())
-            llvm::errs() << "LLL: sym: " << *sym << '\n';
-        }
-        #endif
-
-        // Single in a context where there was no privatization
-        // TODO test with parallel shared()
-        // Check if ultimate symbol is in a program unit scope
-        bool varIsPrivate = false;
-        bool varInCommonBlock;
-        if (HasSymbolInEnclosingScope(symbol, currScope()) &&
-            symbol == symbol.GetUltimate()) {
-          // llvm::errs() << "LLL: sym_scope: " << symbol.owner() << '\n';
-          switch (symbol.owner().kind()) {
-            case Scope::Kind::MainProgram:
-            case Scope::Kind::Subprogram:
-            case Scope::Kind::BlockConstruct:
-              llvm::errs() << "LLL: SAVE=" << symbol.attrs().test(Attr::SAVE)
-                           << "  COMMON=" << symbol.owner().FindCommonBlock(symbol.name())
-                           << '\n';
-              // Optimization: add OmpInCommonBlock flag to Symbol
-              varInCommonBlock = false;
-              for (const auto &cb : symbol.owner().commonBlocks()) {
-                const Symbol &cbsym = cb.second.get();
-                const auto &details = cbsym.get<CommonBlockDetails>();
-                for (const auto &sym : details.objects()) {
-                  llvm::errs() << "LLL: cbsym: " << *sym << '\n';
-                  if (symbol == *sym) {
-                    varInCommonBlock = true;
-                    break;
-                  }
-                }
-                if (varInCommonBlock)
-                  break;
-              }
-              varIsPrivate = !symbol.attrs().test(Attr::SAVE) &&
-                !varInCommonBlock;
-              // gfortran allows dummy arguments as implicitly private too
-              break;
-            default:
-              ;
-          }
-        }
-
-        if (!varIsPrivate) {
-          context_.Say(name.source,
-              "COPYPRIVATE variable '%s' is not PRIVATE or THREADPRIVATE in "
-              "outer context"_err_en_US,
-              symbol.name());
-        }
+      // If the symbol used in 'copyprivate' has not gone through constructs
+      // that may privatize the original symbol, then it may be predetermined
+      // as private in some cases.
+      // (OMP 5.2 5.1.1 - Variables Referenced in a Construct)
+      if (!HasSymbolInEnclosingScope(symbol, currScope()) ||
+          symbol != symbol.GetUltimate() ||
+          !IsSymbolPredeterminedAsPrivate(symbol)) {
+        context_.Say(name.source,
+            "COPYPRIVATE variable '%s' is not PRIVATE or THREADPRIVATE in "
+            "outer context"_err_en_US,
+            symbol.name());
       }
     }
   }
