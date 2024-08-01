@@ -2097,7 +2097,7 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
 
     // Implicitly determined DSAs
     // OMP 5.2 5.1.1 - Variables Referenced in a Construct
-    Symbol *lastDeclSymbol = nullptr;
+    std::vector<const Symbol *> lastDeclSymbols;
     std::optional<Symbol::Flag> prevDSA;
     for (int dirDepth{0}; dirDepth < (int)dirContext_.size(); ++dirDepth) {
       DirContext &dirContext = dirContext_[dirDepth];
@@ -2142,6 +2142,11 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
       // it would have the private flag set.
       // This would make x appear to be defined in p2, causing it to be
       // privatized in p2 and its privatization in p1 to be skipped.
+      auto hostSymbol = [&](const Symbol *sym, int index = 0) {
+        if (lastDeclSymbols.empty())
+          return &sym->GetUltimate();
+        return lastDeclSymbols[index];
+      };
       auto declPrivateSymbol = [&](const Symbol *sym, Symbol::Flag flag,
                                    bool implicit) {
         Symbol *newSym = DeclareAssocSymbol(
@@ -2151,29 +2156,42 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
         return newSym;
       };
       auto makePrivateSymbol = [&](Symbol::Flag flag, bool implicit = false) {
+        bool hasLastDeclSymbols = !lastDeclSymbols.empty();
+        auto updateLastDeclSymbols = [&](const Symbol *sym, int index = 0) {
+          if (hasLastDeclSymbols)
+            lastDeclSymbols[index] = sym;
+          else
+            lastDeclSymbols.push_back(sym);
+        };
+
         if (stmtFunctionSymbols.empty()) {
-          Symbol *hostSymbol =
-              lastDeclSymbol ? lastDeclSymbol : &symbol->GetUltimate();
-          lastDeclSymbol = declPrivateSymbol(hostSymbol, flag, implicit);
+          const Symbol *newSym = declPrivateSymbol(hostSymbol(symbol), flag, implicit);
+          updateLastDeclSymbols(newSym);
           return;
         }
 
+        int i = 0;
         for (const auto *sym : stmtFunctionSymbols) {
-          Symbol *newSym = declPrivateSymbol(sym, flag, implicit);
+          Symbol *newSym = declPrivateSymbol(hostSymbol(sym, i), flag, implicit);
           newSym->set(Symbol::Flag::OmpFromStmtFunction);
+          updateLastDeclSymbols(newSym, i++);
         }
       };
       auto makeSharedSymbol = [&]() {
-        Symbol *hostSymbol =
-            lastDeclSymbol ? lastDeclSymbol : &symbol->GetUltimate();
-        MakeAssocSymbol(symbol->name(), *hostSymbol,
-            context_.FindScope(dirContext.directiveSource));
+        if (stmtFunctionSymbols.empty()) {
+          MakeAssocSymbol(symbol->name(), *hostSymbol(symbol),
+              context_.FindScope(dirContext.directiveSource));
+        } else {
+          int i = 0;
+          for (const auto *sym : stmtFunctionSymbols) {
+            MakeAssocSymbol(sym->name(), *hostSymbol(sym, i++),
+                context_.FindScope(dirContext.directiveSource));
+          }
+        }
       };
       auto useLastDeclSymbol = [&]() {
-        // XXX Needed by stmt funcs?
-        if (lastDeclSymbol)
-          MakeAssocSymbol(symbol->name(), *lastDeclSymbol,
-              context_.FindScope(dirContext.directiveSource));
+        if (!lastDeclSymbols.empty())
+          makeSharedSymbol();
       };
 
       bool taskGenDir = llvm::omp::taskGeneratingSet.test(dirContext.directive);
