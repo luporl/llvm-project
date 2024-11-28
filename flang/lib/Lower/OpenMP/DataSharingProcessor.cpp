@@ -116,6 +116,38 @@ void DataSharingProcessor::cloneSymbol(const semantics::Symbol *sym) {
       *sym, /*skipDefaultInit=*/isFirstPrivate);
   (void)success;
   assert(success && "Privatization failed due to existing binding");
+
+  auto needInitClone = [&] {
+    if (isFirstPrivate)
+      return false;
+
+    SymbolBox sb = symTable.lookupSymbol(sym);
+    assert(sb);
+    mlir::Value addr = sb.getAddr();
+    assert(addr);
+    mlir::Type ty = addr.getType();
+
+    // Unwrap type, check if it is a record with allocatable member
+
+    // llvm::errs() << "LLL: ty1: " << ty << '\n';
+    // ty = fir::unwrapRefType(ty);
+    while (auto eleTy = fir::dyn_cast_ptrOrBoxEleTy(ty)) {
+      ty = eleTy;
+      // llvm::errs() << "LLL: ty2: " << ty << '\n';
+    }
+
+    if (auto seqTy = mlir::dyn_cast<fir::SequenceType>(ty)) {
+      ty = seqTy.getEleTy();
+      // llvm::errs() << "LLL: ty3: " << ty << '\n';
+    }
+
+    return fir::isRecordWithAllocatableMember(ty);
+  };
+
+  if (needInitClone()) {
+    llvm::errs() << "LLL: isRecordWithAllocatableMember\n";
+    Fortran::lower::initializeCloneAtRuntime(converter, *sym, symTable);
+  }
 }
 
 void DataSharingProcessor::copyFirstPrivateSymbol(

@@ -24,6 +24,7 @@
 #include "flang/Lower/StatementContext.h"
 #include "flang/Lower/Support/Utils.h"
 #include "flang/Lower/SymbolMap.h"
+#include "flang/Optimizer/Builder/BoxValue.h"
 #include "flang/Optimizer/Builder/Character.h"
 #include "flang/Optimizer/Builder/FIRBuilder.h"
 #include "flang/Optimizer/Builder/HLFIRTools.h"
@@ -796,6 +797,36 @@ void Fortran::lower::defaultInitializeAtRuntime(
     mlir::Value box = builder.createBox(loc, exv);
     fir::runtime::genDerivedTypeInitialize(builder, loc, box);
   }
+}
+
+// TODO export from Bridge.cpp
+fir::ExtendedValue
+symBoxToExtendedValue(Fortran::lower::AbstractConverter &converter,
+                      const Fortran::lower::SymbolBox &symBox) {
+  return symBox.match(
+      [](const Fortran::lower::SymbolBox::Intrinsic &box)
+          -> fir::ExtendedValue { return box.getAddr(); },
+      [](const Fortran::lower::SymbolBox::None &) -> fir::ExtendedValue {
+        llvm::report_fatal_error("symbol not mapped");
+      },
+      [&](const fir::FortranVariableOpInterface &x) -> fir::ExtendedValue {
+        return hlfir::translateToExtendedValue(converter.getCurrentLocation(),
+                                               converter.getFirOpBuilder(), x);
+      },
+      [](const auto &box) -> fir::ExtendedValue { return box; });
+}
+
+void Fortran::lower::initializeCloneAtRuntime(
+    Fortran::lower::AbstractConverter &converter,
+    const Fortran::semantics::Symbol &sym, Fortran::lower::SymMap &symMap) {
+  fir::FirOpBuilder &builder = converter.getFirOpBuilder();
+  mlir::Location loc = converter.getCurrentLocation();
+  fir::ExtendedValue exv = converter.getSymbolExtendedValue(sym, &symMap);
+  mlir::Value newBox = builder.createBox(loc, exv);
+  lower::SymbolBox hsb = converter.lookupOneLevelUpSymbol(sym);
+  fir::ExtendedValue hexv = symBoxToExtendedValue(converter, hsb);
+  mlir::Value box = builder.createBox(loc, hexv);
+  fir::runtime::genDerivedTypeInitializeClone(builder, loc, newBox, box);
 }
 
 enum class VariableCleanUp { Finalize, Deallocate };
