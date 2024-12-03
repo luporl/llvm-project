@@ -13,6 +13,8 @@
 #include "type-info.h"
 #include "flang/Runtime/descriptor.h"
 
+#include <stdio.h>
+
 namespace Fortran::runtime {
 
 RT_OFFLOAD_API_GROUP_BEGIN
@@ -27,6 +29,119 @@ static RT_API_ATTRS void GetComponentExtents(SubscriptValue (&extents)[maxRank],
     auto ub{bounds[2 * dim + 1].GetValue(&derivedInstance).value_or(0)};
     extents[dim] = ub >= lb ? static_cast<SubscriptValue>(ub - lb + 1) : 0;
   }
+}
+
+#define DT_DEBUG  0
+
+#pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
+#if DT_DEBUG
+#define DPRINTF(msg, ...) \
+  printf("LLL: %s: " msg "\n", __func__, ## __VA_ARGS__)
+#else
+#define DPRINTF(msg, ...)   do { } while (0)
+#endif
+
+// Initialize 'clone' var from 'orig' var.
+//
+// clone - the clone
+// orig  - the original var
+// derived - derived type info
+// terminator - the terminator
+// hasStat - has error status?
+// errMsg - message to display on errors
+RT_API_ATTRS int InitializeClone(
+    const Descriptor &clone, const Descriptor &orig,
+    const typeInfo::DerivedType &derived, Terminator &terminator, bool hasStat,
+    const Descriptor *errMsg) {
+  DPRINTF("begin");
+
+  // Get DT components
+  const Descriptor &componentDesc{derived.component()};
+  // Number of elements. 1 if 'orig' is not an array
+  std::size_t elements{orig.Elements()};
+  DPRINTF("oelems = %lu", elements);
+
+  int stat{StatOk};
+
+  // foreach DT component
+  std::size_t myComponents{componentDesc.Elements()};
+  for (std::size_t i{0}; i < myComponents; ++i) {
+    // get component 'i'
+    const typeInfo::Component &comp{
+        *componentDesc.ZeroBasedIndexedElement<typeInfo::Component>(i)};
+    DPRINTF("comp: %s", comp.name().OffsetElement());
+
+    // get 'orig' lower bounds
+    SubscriptValue at[maxRank];
+    orig.GetLowerBounds(at);
+    DPRINTF("lb[0] = %ld", at[0]);
+
+    // if is allocatable
+    if (comp.genre() == typeInfo::Component::Genre::Allocatable) {
+      DPRINTF("allocatable");
+      // foreach orig-array-element, init allocatable component
+      for (std::size_t j{0}; j++ < elements; orig.IncrementSubscripts(at)) {
+        // get orig and clone descriptors for component 'comp's 'j' element
+        Descriptor &origDesc{
+            *orig.ElementComponent<Descriptor>(at, comp.offset())};
+        Descriptor &cloneDesc{
+            *clone.ElementComponent<Descriptor>(at, comp.offset())};
+
+        // if 'origDesc' is allocated the allocate 'cloneDesc'
+        if (origDesc.IsAllocated()) {
+          // set 'cloneDesc' dimensions to 'origDesc' ones
+          cloneDesc.ApplyMold(origDesc, origDesc.rank());
+          DPRINTF("allocated: %d (%ld)", origDesc.rank(), origDesc.GetDimension(0).Extent());
+
+          // allocate
+          stat = ReturnError(terminator, cloneDesc.Allocate(), errMsg, hasStat);
+          if (stat == StatOk) {
+            // init if it is a derived allocatable
+#if 0
+            if (const DescriptorAddendum * addendum{cloneDesc.Addendum()}) {
+              if (const auto *derived{addendum->derivedType()}) {
+                if (!derived->noInitializationNeeded()) {
+                  stat = Initialize(
+                      cloneDesc, *derived, terminator, hasStat, errMsg);
+                }
+              }
+            }
+#endif
+          }
+        }
+        DPRINTF("%s", stat == StatOk ? "success" : "failure");
+        if (stat != StatOk) {
+          break;
+        }
+      }
+    // TODO: pointers to record
+    }
+
+#if 0
+    else if (comp.genre() == typeInfo::Component::Genre::Data &&
+        comp.derivedType()) {
+      // Default initialization of non-pointer non-allocatable/automatic
+      // data component.  Handles parent component's elements.  Recursive.
+      SubscriptValue extents[maxRank];
+      GetComponentExtents(extents, comp, instance);
+      StaticDescriptor<maxRank, true, 0> staticDescriptor;
+      Descriptor &compDesc{staticDescriptor.descriptor()};
+      const typeInfo::DerivedType &compType{*comp.derivedType()};
+      for (std::size_t j{0}; j++ < elements; instance.IncrementSubscripts(at)) {
+        compDesc.Establish(compType,
+            instance.ElementComponent<char>(at, comp.offset()), comp.rank(),
+            extents);
+        stat = Initialize(compDesc, compType, terminator, hasStat, errMsg);
+        if (stat != StatOk) {
+          break;
+        }
+      }
+    }
+#endif
+  }
+
+  DPRINTF("end");
+  return stat;
 }
 
 RT_API_ATTRS int Initialize(const Descriptor &instance,

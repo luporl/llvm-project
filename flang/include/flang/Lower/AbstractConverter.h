@@ -120,8 +120,6 @@ public:
   virtual bool
   createHostAssociateVarClone(const Fortran::semantics::Symbol &sym) = 0;
 
-  virtual void initializeHostAssociateVarClone(const Fortran::semantics::Symbol &sym) = 0;
-
   virtual void
   createHostAssociateVarCloneDealloc(const Fortran::semantics::Symbol &sym) = 0;
 

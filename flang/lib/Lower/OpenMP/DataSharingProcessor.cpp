@@ -119,7 +119,7 @@ void DataSharingProcessor::cloneSymbol(const semantics::Symbol *sym) {
   if (!isFirstPrivate) {
     if (Fortran::lower::hasDefaultInitialization(sym->GetUltimate()))
       Fortran::lower::defaultInitializeAtRuntime(converter, *sym, *symTable);
-    converter.initializeHostAssociateVarClone(*sym);
+    Fortran::lower::initializeCloneAtRuntime(converter, *sym, *symTable);
   }
 }
 

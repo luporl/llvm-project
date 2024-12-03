@@ -21,6 +21,10 @@ namespace Fortran::runtime {
 class Descriptor;
 class Terminator;
 
+RT_API_ATTRS int InitializeClone(const Descriptor &, const Descriptor &,
+    const typeInfo::DerivedType &,
+    Terminator &, bool hasStat = false, const Descriptor *errMsg = nullptr);
+
 // Perform default component initialization, allocate automatic components.
 // Returns a STAT= code (0 when all's well).
 RT_API_ATTRS int Initialize(const Descriptor &, const typeInfo::DerivedType &,

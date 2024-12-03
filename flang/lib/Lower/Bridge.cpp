@@ -710,118 +710,6 @@ public:
     return bool(shallowLookupSymbol(sym));
   }
 
-  void initializeHostAssociateVarClone(const Fortran::semantics::Symbol &sym) override final {
-    const Fortran::lower::SymbolBox &dstBox = lookupSymbol(sym);
-    const Fortran::lower::SymbolBox &srcBox = lookupOneLevelUpSymbol(sym);
-    mlir::Value dst = dstBox.getAddr();
-    mlir::Value src = srcBox.getAddr();
-    mlir::Type ty = dst.getType();
-    mlir::Location loc = genLocation(sym.name());
-    copyRecordAllocatableMembers(loc, ty, dst, src);
-  }
-
-  void copyRecordAllocatableMembers(mlir::Location loc, mlir::Type ty,
-                                    mlir::Value dst, mlir::Value src) {
-    // TODO handle records inside arrays
-
-    // Get RecordType
-    auto recTy = mlir::dyn_cast<fir::RecordType>(fir::unwrapPassByRefType(ty));
-    if (!recTy)
-      return;
-
-    auto allocate = [&](const std::string &fieldName, mlir::Type fieldTy) {
-      // Get `src` field coordinate
-      auto fieldIndexTy = fir::FieldType::get(dst.getContext());
-      auto fieldRefTy = builder->getRefType(fieldTy);
-
-      mlir::Value srcField = builder->create<fir::FieldIndexOp>(
-          loc, fieldIndexTy, fieldName, recTy, fir::getTypeParams(src));
-      mlir::Value srcCoor = builder->create<fir::CoordinateOp>(
-          loc, fieldRefTy, src, srcField);
-      llvm::errs() << "LLL: srcField: " << srcField << '\n';
-      llvm::errs() << "LLL: srcCoor:  " << srcCoor << '\n';
-      fir::MutableBoxValue srcBox(srcCoor, {}, {});
-
-      // Get `dst` field coordinate
-      mlir::Value dstField = builder->create<fir::FieldIndexOp>(
-          loc, fieldIndexTy, fieldName, recTy, fir::getTypeParams(dst));
-      mlir::Value dstCoor = builder->create<fir::CoordinateOp>(
-          loc, fieldRefTy, dst, dstField);
-      llvm::errs() << "LLL: dstField: " << dstField << '\n';
-      llvm::errs() << "LLL: dstCoor:  " << dstCoor << '\n';
-      fir::MutableBoxValue dstBox(dstCoor, {}, {});
-
-      // Init `dst`
-      // FIXME make allocName unique, if needed
-      initAllocatableVarClone(loc, dstBox, srcBox, fieldName + ".alloc");
-    };
-
-    llvm::errs() << "LLL: " << __func__ << ": " << recTy << '\n';
-    for (auto [fieldName, fieldTy] : recTy.getTypeList()) {
-      if (fir::isAllocatableType(fieldTy)) {
-        llvm::errs() << "LLL: " << __func__ << ": " << fieldName << ", " << fieldTy << '\n';
-
-        allocate(fieldName, fieldTy);
-      // A record type cannot recursively include itself as a direct member.
-      // There must be an intervening `ptr` type, so recursion is safe here.
-      } else if (auto fieldRecTy = mlir::dyn_cast<fir::RecordType>(fieldTy)) {
-        copyRecordAllocatableMembers(loc, fieldRecTy, dst, src);
-      }
-    }
-  }
-
-  void initAllocatableVarClone(mlir::Location loc,
-      const fir::MutableBoxValue &dst,
-      const fir::MutableBoxValue &src,
-      const std::string &allocName) {
-    // Allocate storage for an allocatble descriptor.
-    // No shape/lengths to be passed to the alloca.
-
-    // allocate if allocated
-    mlir::Value isAllocated =
-        fir::factory::genIsAllocatedOrAssociatedTest(*builder, loc, src);
-    auto ifBuilder = builder->genIfThenElse(loc, isAllocated);
-    ifBuilder.genThen([&]() {
-      fir::ExtendedValue read = fir::factory::genMutableBoxRead(
-          *builder, loc, src, /*mayBePolymorphic=*/false);
-      if (const auto *readArrBox = read.getBoxOf<fir::ArrayBoxValue>()) {
-        fir::factory::genInlinedAllocation(
-            *builder, loc, dst, readArrBox->getLBounds(),
-            readArrBox->getExtents(),
-            /*lenParams=*/std::nullopt, allocName,
-            /*mustBeHeap=*/true);
-      } else if (const auto *readCharArrBox =
-                     read.getBoxOf<fir::CharArrayBoxValue>()) {
-        fir::factory::genInlinedAllocation(
-            *builder, loc, dst, readCharArrBox->getLBounds(),
-            readCharArrBox->getExtents(), readCharArrBox->getLen(),
-            allocName,
-            /*mustBeHeap=*/true);
-      } else if (const auto *readCharBox =
-                     read.getBoxOf<fir::CharBoxValue>()) {
-        fir::factory::genInlinedAllocation(*builder, loc, dst,
-                                           /*lbounds=*/std::nullopt,
-                                           /*extents=*/std::nullopt,
-                                           readCharBox->getLen(), allocName,
-                                           /*mustBeHeap=*/true);
-      } else {
-        fir::factory::genInlinedAllocation(
-            *builder, loc, dst, src.getMutableProperties().lbounds,
-            src.getMutableProperties().extents,
-            src.nonDeferredLenParams(), allocName,
-            /*mustBeHeap=*/true);
-      }
-    });
-    ifBuilder.genElse([&]() {
-      // nullify src
-      auto empty = fir::factory::createUnallocatedBox(
-          *builder, loc, dst.getBoxTy(),
-          dst.nonDeferredLenParams(), {});
-      builder->create<fir::StoreOp>(loc, empty, dst.getAddr());
-    });
-    ifBuilder.end();
-  }
-
   bool createHostAssociateVarClone(
       const Fortran::semantics::Symbol &sym) override final {
     mlir::Location loc = genLocation(sym.name());
@@ -881,19 +769,58 @@ public:
     hexv.match(
         [&](const fir::MutableBoxValue &box) -> void {
           // Do not process pointers
-          if (!Fortran::semantics::IsPointer(sym.GetUltimate())) {
-            const auto *newBox = exv.getBoxOf<fir::MutableBoxValue>();
-            assert(newBox);
-            initAllocatableVarClone(loc, *newBox, box, mangleName(sym) + ".alloc");
+          if (Fortran::semantics::IsPointer(sym.GetUltimate())) {
+            return;
           }
+          // Allocate storage for a pointer/allocatble descriptor.
+          // No shape/lengths to be passed to the alloca.
+          const auto new_box = exv.getBoxOf<fir::MutableBoxValue>();
+
+          // allocate if allocated
+          mlir::Value isAllocated =
+              fir::factory::genIsAllocatedOrAssociatedTest(*builder, loc, box);
+          auto if_builder = builder->genIfThenElse(loc, isAllocated);
+          if_builder.genThen([&]() {
+            std::string name = mangleName(sym) + ".alloc";
+            fir::ExtendedValue read = fir::factory::genMutableBoxRead(
+                *builder, loc, box, /*mayBePolymorphic=*/false);
+            if (auto read_arr_box = read.getBoxOf<fir::ArrayBoxValue>()) {
+              fir::factory::genInlinedAllocation(
+                  *builder, loc, *new_box, read_arr_box->getLBounds(),
+                  read_arr_box->getExtents(),
+                  /*lenParams=*/std::nullopt, name,
+                  /*mustBeHeap=*/true);
+            } else if (auto read_char_arr_box =
+                           read.getBoxOf<fir::CharArrayBoxValue>()) {
+              fir::factory::genInlinedAllocation(
+                  *builder, loc, *new_box, read_char_arr_box->getLBounds(),
+                  read_char_arr_box->getExtents(), read_char_arr_box->getLen(),
+                  name,
+                  /*mustBeHeap=*/true);
+            } else if (auto read_char_box =
+                           read.getBoxOf<fir::CharBoxValue>()) {
+              fir::factory::genInlinedAllocation(*builder, loc, *new_box,
+                                                 /*lbounds=*/std::nullopt,
+                                                 /*extents=*/std::nullopt,
+                                                 read_char_box->getLen(), name,
+                                                 /*mustBeHeap=*/true);
+            } else {
+              fir::factory::genInlinedAllocation(
+                  *builder, loc, *new_box, box.getMutableProperties().lbounds,
+                  box.getMutableProperties().extents,
+                  box.nonDeferredLenParams(), name,
+                  /*mustBeHeap=*/true);
+            }
+          });
+          if_builder.genElse([&]() {
+            // nullify box
+            auto empty = fir::factory::createUnallocatedBox(
+                *builder, loc, new_box->getBoxTy(),
+                new_box->nonDeferredLenParams(), {});
+            builder->create<fir::StoreOp>(loc, empty, new_box->getAddr());
+          });
+          if_builder.end();
         },
-        /*
-        [&](const mlir::Value &val) -> void {
-          llvm::errs() << "LLL: dt\n";
-          assert(exv.getUnboxed());
-          copyRecordAllocatableMembers(loc, val.getType(), *exv.getUnboxed(), val);
-        },
-         */
         [&](const auto &) -> void {
           // Do nothing
         });
