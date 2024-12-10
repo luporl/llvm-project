@@ -122,8 +122,8 @@ public:
                        const List<Clause> &clauses,
                        lower::pft::Evaluation &eval,
                        bool shouldCollectPreDeterminedSymbols,
-                       bool useDelayedPrivatization = false,
-                       lower::SymMap *symTable = nullptr);
+                       bool useDelayedPrivatization,
+                       lower::SymMap *symTable);
 
   // Privatisation is split into two steps.
   // Step1 performs cloning of all privatisation clauses and copying for

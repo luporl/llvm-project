@@ -804,7 +804,8 @@ static void createBodyOfOp(mlir::Operation &op, const OpWithBodyGenInfo &info,
   std::optional<DataSharingProcessor> tempDsp;
   if (privatize && !info.dsp) {
     tempDsp.emplace(info.converter, info.semaCtx, *info.clauses, info.eval,
-                    Fortran::lower::omp::isLastItemInQueue(item, queue));
+                    Fortran::lower::omp::isLastItemInQueue(item, queue),
+                    /*useDelayedPrivatization=*/false, &info.symTable);
     tempDsp->processStep1();
   }
 
@@ -1629,7 +1630,8 @@ genSectionsOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
   // Insert privatizations before SECTIONS
   lower::SymMapScope scope(symTable);
   DataSharingProcessor dsp(converter, semaCtx, item->clauses, eval,
-                           lower::omp::isLastItemInQueue(item, queue));
+                           lower::omp::isLastItemInQueue(item, queue),
+                           /*useDelayedPrivatization=*/false, &symTable);
   dsp.processStep1();
 
   List<Clause> nonDsaClauses;
