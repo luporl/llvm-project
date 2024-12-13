@@ -31,16 +31,64 @@ static RT_API_ATTRS void GetComponentExtents(SubscriptValue (&extents)[maxRank],
   }
 }
 
-#define DT_DEBUG 0
+/// DEBUG STUFF ///
 
 #pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
+
+static unsigned g_lock;
+
+static void lock()
+{
+    while (!__sync_bool_compare_and_swap(&g_lock, 0, 1))
+      ;
+}
+
+static void unlock()
+{
+    g_lock = 0;
+}
+
+static int unused()
+{
+  lock();
+  unlock();
+  return 0;
+}
+static int g_unused = unused();
+
+#define PRINTF(msg, ...)                                    \
+  do {                                                      \
+    lock();                                                 \
+    fprintf(stderr, "LLL: %s: " msg "\n", __func__, ##__VA_ARGS__);  \
+    unlock();                                               \
+  } while (0)
+
+
+#define DT_DEBUG 0
+
 #if DT_DEBUG
-#define DPRINTF(msg, ...) printf("LLL: %s: " msg "\n", __func__, ##__VA_ARGS__)
+
+static const char *g_name(const typeInfo::Component &comp, char *buf)
+{
+  memset(buf, 0, comp.name().ElementBytes() + 1);
+  memcpy(buf, comp.name().OffsetElement(), comp.name().ElementBytes());
+  return buf;
+}
+
+#define DPRINTF(msg, ...)                                   \
+  do {                                                      \
+    lock();                                                 \
+    printf("LLL: %s: " msg "\n", __func__, ##__VA_ARGS__);  \
+    unlock();                                               \
+  } while (0)
+
 #else
 #define DPRINTF(msg, ...) \
   do { \
   } while (0)
 #endif
+
+/// END DEBUG STUFF ///
 
 // Initialize 'clone' var from 'orig' var.
 //
@@ -53,13 +101,17 @@ static RT_API_ATTRS void GetComponentExtents(SubscriptValue (&extents)[maxRank],
 RT_API_ATTRS int InitializeClone(const Descriptor &clone,
     const Descriptor &orig, const typeInfo::DerivedType &derived,
     Terminator &terminator, bool hasStat, const Descriptor *errMsg) {
-  DPRINTF("begin");
+#if DT_DEBUG
+  char buf[256];
+#endif
+
+  // __sync_synchronize();
 
   // Get DT components
   const Descriptor &componentDesc{derived.component()};
   // Number of elements. 1 if 'orig' is not an array
   std::size_t elements{orig.Elements()};
-  DPRINTF("oelems = %lu", elements);
+  DPRINTF("begin: oelems = %lu", elements);
 
   int stat{StatOk};
 
@@ -69,45 +121,62 @@ RT_API_ATTRS int InitializeClone(const Descriptor &clone,
     // get component 'i'
     const typeInfo::Component &comp{
         *componentDesc.ZeroBasedIndexedElement<typeInfo::Component>(i)};
-    DPRINTF("comp: %s", comp.name().OffsetElement());
+    DPRINTF("comp: %s", g_name(comp, buf));
 
     // get 'orig' lower bounds
     SubscriptValue at[maxRank];
     orig.GetLowerBounds(at);
-    DPRINTF("lb[0] = %ld", at[0]);
+    // DPRINTF("lb[0] = %ld", at[0]);
 
     // if is allocatable
     if (comp.genre() == typeInfo::Component::Genre::Allocatable) {
       DPRINTF("allocatable");
       // foreach orig-array-element, init allocatable component
-      for (std::size_t j{0}; j++ < elements; orig.IncrementSubscripts(at)) {
+      for (std::size_t j{0}; j < elements; ++j, orig.IncrementSubscripts(at)) {
         // get orig and clone descriptors for component 'comp's 'j' element
-        Descriptor &origDesc{
-            *orig.ElementComponent<Descriptor>(at, comp.offset())};
-        Descriptor &cloneDesc{
-            *clone.ElementComponent<Descriptor>(at, comp.offset())};
+        /*
+        PRINTF("0x%016llx %llu",
+            (uint64_t)orig.ElementComponent<Descriptor>(at, comp.offset()),
+            // (uint64_t)orig.OffsetElement(),
+            orig.SubscriptsToByteOffset(at) + comp.offset());
+         */
+
+        // TODO: use references again
+        Descriptor *origDesc{
+            orig.ElementComponent<Descriptor>(at, comp.offset())};
+        Descriptor *cloneDesc{
+            clone.ElementComponent<Descriptor>(at, comp.offset())};
+        // PRINTF("0x%016llx", (uint64_t)origDesc);
+        // origDesc.Dump();
+        // cloneDesc.Dump();
 
         // if 'origDesc' is allocated the allocate 'cloneDesc'
-        if (origDesc.IsAllocated()) {
+        // TODO remove '&& cloneDesc'
+        if (origDesc->IsAllocated() && cloneDesc) {
           // set 'cloneDesc' dimensions to 'origDesc' ones
-          cloneDesc.ApplyMold(origDesc, origDesc.rank());
-          DPRINTF("allocated: %d (%ld)", origDesc.rank(),
+          cloneDesc->ApplyMold(*origDesc, origDesc->rank());
+          DPRINTF("allocated #%d: (extent=%ld)", origDesc.rank(),
               origDesc.GetDimension(0).Extent());
 
           // allocate
-          stat = ReturnError(terminator, cloneDesc.Allocate(), errMsg, hasStat);
+          stat = ReturnError(terminator, cloneDesc->Allocate(), errMsg, hasStat);
+          // Init allocatable record
           if (stat == StatOk) {
-            // init if it is a derived allocatable
-#if 0
-            if (const DescriptorAddendum * addendum{cloneDesc.Addendum()}) {
+            if (const DescriptorAddendum * addendum{cloneDesc->Addendum()}) {
               if (const auto *derived{addendum->derivedType()}) {
                 if (!derived->noInitializationNeeded()) {
+                  DPRINTF("default init %s", g_name(comp, buf));
                   stat = Initialize(
-                      cloneDesc, *derived, terminator, hasStat, errMsg);
+                      *cloneDesc, *derived, terminator, hasStat, errMsg);
+                }
+                // Init record's allocatables
+                if (stat == StatOk) {
+                  DPRINTF("clone init %s", g_name(comp, buf));
+                  stat = InitializeClone(*cloneDesc, *origDesc, *derived,
+                                         terminator, hasStat, errMsg);
                 }
               }
             }
-#endif
           }
         }
         DPRINTF("%s", stat == StatOk ? "success" : "failure");
@@ -115,30 +184,43 @@ RT_API_ATTRS int InitializeClone(const Descriptor &clone,
           break;
         }
       }
-      // TODO: pointers to record
-    }
-
-#if 0
-    else if (comp.genre() == typeInfo::Component::Genre::Data &&
+    } else if (comp.genre() == typeInfo::Component::Genre::Data &&
         comp.derivedType()) {
-      // Default initialization of non-pointer non-allocatable/automatic
-      // data component.  Handles parent component's elements.  Recursive.
+      // Nested records
+      // get extents
       SubscriptValue extents[maxRank];
-      GetComponentExtents(extents, comp, instance);
-      StaticDescriptor<maxRank, true, 0> staticDescriptor;
-      Descriptor &compDesc{staticDescriptor.descriptor()};
+      GetComponentExtents(extents, comp, orig);
+
+      // allocate descriptors for data orig/clone data components
+      StaticDescriptor<maxRank, true, 0> origStaticDesc;
+      StaticDescriptor<maxRank, true, 0> cloneStaticDesc;
+      Descriptor &origDesc{origStaticDesc.descriptor()};
+      Descriptor &cloneDesc{cloneStaticDesc.descriptor()};
+
+      // get derived type
       const typeInfo::DerivedType &compType{*comp.derivedType()};
-      for (std::size_t j{0}; j++ < elements; instance.IncrementSubscripts(at)) {
-        compDesc.Establish(compType,
-            instance.ElementComponent<char>(at, comp.offset()), comp.rank(),
+
+      for (std::size_t j{0}; j < elements; ++j, orig.IncrementSubscripts(at)) {
+        DPRINTF("nested #%lu: %s", j, g_name(comp, buf));
+
+        // init descriptors
+        origDesc.Establish(compType,
+            orig.ElementComponent<char>(at, comp.offset()), comp.rank(),
             extents);
-        stat = Initialize(compDesc, compType, terminator, hasStat, errMsg);
+        cloneDesc.Establish(compType,
+            clone.ElementComponent<char>(at, comp.offset()), comp.rank(),
+            extents);
+
+        // origDesc.Dump();
+        // cloneDesc.Dump();
+        // recursively init the nested record
+        stat = InitializeClone(cloneDesc, origDesc, compType, terminator,
+                               hasStat, errMsg);
         if (stat != StatOk) {
           break;
         }
       }
     }
-#endif
   }
 
   DPRINTF("end");

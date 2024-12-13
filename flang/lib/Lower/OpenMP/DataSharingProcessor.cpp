@@ -146,6 +146,7 @@ void DataSharingProcessor::cloneSymbol(const semantics::Symbol *sym) {
 
   if (needInitClone()) {
     llvm::errs() << "LLL: isRecordWithAllocatableMember\n";
+    callsInitClone = true;
     Fortran::lower::initializeCloneAtRuntime(converter, *sym, symTable);
   }
 }
@@ -197,8 +198,9 @@ bool DataSharingProcessor::needBarrier() {
   // variables.
   // Emit implicit barrier for linear clause. Maybe on somewhere else.
   for (const semantics::Symbol *sym : allPrivatizedSymbols) {
-    if (sym->test(semantics::Symbol::Flag::OmpFirstPrivate) &&
-        sym->test(semantics::Symbol::Flag::OmpLastPrivate))
+    if (sym->test(semantics::Symbol::Flag::OmpLastPrivate) &&
+        (sym->test(semantics::Symbol::Flag::OmpFirstPrivate) ||
+         callsInitClone))
       return true;
   }
   return false;
