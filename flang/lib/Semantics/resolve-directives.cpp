@@ -19,9 +19,11 @@
 #include "flang/Parser/parse-tree.h"
 #include "flang/Parser/tools.h"
 #include "flang/Semantics/expression.h"
+#include "flang/Semantics/openmp-dsa.h"
 #include "flang/Semantics/openmp-modifiers.h"
 #include "flang/Semantics/symbol.h"
 #include "flang/Semantics/tools.h"
+#include "llvm/Support/Debug.h"
 #include <list>
 #include <map>
 #include <sstream>
@@ -831,6 +833,15 @@ private:
 
   void CreateImplicitSymbols(
       const Symbol *symbol, std::optional<Symbol::Flag> setFlag = std::nullopt);
+
+  void AddToContextObjectWithExplicitDSA(Symbol &symbol, Symbol::Flag flag) {
+    AddToContextObjectWithDSA(symbol, flag);
+    if (dataSharingAttributeFlags.test(flag) &&
+        flag != Symbol::Flag::OmpReduction &&
+        symbol.detailsIf<HostAssocDetails>()) {
+      symbol.set(Symbol::Flag::OmpExplicit);
+    }
+  }
 };
 
 template <typename T>
@@ -1600,6 +1611,19 @@ void AccAttributeVisitor::CheckMultipleAppearances(
   }
 }
 
+#ifndef NDEBUG
+
+#define DEBUG_TYPE "omp"
+
+static llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const Symbol::Flags &flags);
+
+namespace dbg {
+static void DumpAssocSymbols(const Symbol &sym);
+static std::string ScopeSourcePos(const Fortran::semantics::Scope &scope);
+} // namespace dbg
+
+#endif
+
 bool OmpAttributeVisitor::Pre(const parser::OpenMPBlockConstruct &x) {
   const auto &beginBlockDir{std::get<parser::OmpBeginBlockDirective>(x.t)};
   const auto &beginDir{std::get<parser::OmpBlockDirective>(beginBlockDir.t)};
@@ -1792,12 +1816,14 @@ void OmpAttributeVisitor::ResolveSeqLoopIndexInParallelOrTaskConstruct(
       }
     }
   }
-  // If this symbol is already Private or Firstprivate in the enclosing
+  // If this symbol is already Private, Firstprivate or Shared in the enclosing
   // OpenMP parallel or task then there is nothing to do here.
   if (auto *symbol{targetIt->scope.FindSymbol(iv.source)}) {
     if (symbol->owner() == targetIt->scope) {
       if (symbol->test(Symbol::Flag::OmpPrivate) ||
-          symbol->test(Symbol::Flag::OmpFirstPrivate)) {
+          symbol->test(Symbol::Flag::OmpFirstPrivate) ||
+          (symbol->test(Symbol::Flag::OmpShared) &&
+           symbol->test(Symbol::Flag::OmpExplicit))) {
         return;
       }
     }
@@ -1806,6 +1832,9 @@ void OmpAttributeVisitor::ResolveSeqLoopIndexInParallelOrTaskConstruct(
   // parallel or task
   if (auto *symbol{ResolveOmp(iv, Symbol::Flag::OmpPrivate, targetIt->scope)}) {
     targetIt++;
+    // PreDetermined symbols have priority over implicit ones.
+    symbol->set(Symbol::Flag::OmpImplicit, /*value=*/false);
+    symbol->set(Symbol::Flag::OmpShared, /*value=*/false);
     symbol->set(Symbol::Flag::OmpPreDetermined);
     iv.symbol = symbol; // adjust the symbol within region
     for (auto it{dirContext_.rbegin()}; it != targetIt; ++it) {
@@ -1918,6 +1947,9 @@ void OmpAttributeVisitor::PrivatizeAssociatedLoopIndexAndCheckLoopLevel(
       const parser::Name *iv{GetLoopIndex(*loop)};
       if (iv) {
         if (auto *symbol{ResolveOmp(*iv, ivDSA, currScope())}) {
+          // PreDetermined symbols have priority over implicit ones.
+          symbol->set(Symbol::Flag::OmpImplicit, /*value=*/false);
+          symbol->set(Symbol::Flag::OmpShared, /*value=*/false);
           symbol->set(Symbol::Flag::OmpPreDetermined);
           iv->symbol = symbol; // adjust the symbol within region
           AddToContextObjectWithDSA(*symbol, ivDSA);
@@ -2180,37 +2212,45 @@ static bool IsPrivatizable(const Symbol *sym) {
 
 void OmpAttributeVisitor::CreateImplicitSymbols(
     const Symbol *symbol, std::optional<Symbol::Flag> setFlag) {
-  if (!IsPrivatizable(symbol)) {
+  if (!IsPrivatizable(symbol) || symbol->test(Symbol::Flag::OmpPreDetermined)) {
     return;
   }
+
+  LLVM_DEBUG(llvm::dbgs() << "CreateImplicitSymbols: " << *symbol << '\n');
 
   // Implicitly determined DSAs
   // OMP 5.2 5.1.1 - Variables Referenced in a Construct
   Symbol *lastDeclSymbol = nullptr;
-  std::optional<Symbol::Flag> prevDSA;
+  Symbol::Flags prevDSA;
   for (int dirDepth{0}; dirDepth < (int)dirContext_.size(); ++dirDepth) {
     DirContext &dirContext = dirContext_[dirDepth];
-    std::optional<Symbol::Flag> dsa;
+    Symbol::Flags dsa;
 
-    for (auto symMap : dirContext.objectWithDSA) {
-      // if the `symbol` already has a data-sharing attribute
-      if (symMap.first->name() == symbol->name()) {
-        dsa = symMap.second;
-        break;
+    Scope &scope{context_.FindScope(dirContext.directiveSource)};
+    auto it = scope.find(symbol->name());
+    if (it != scope.end()) {
+      // There is already a symbol in the current scope.
+      // Usually happens when symbols are set as predetermined.
+      dsa = GetSymbolDSA(*it->second);
+    } else {
+      for (auto symMap : dirContext.objectWithDSA) {
+        // if the `symbol` already has a data-sharing attribute
+        if (symMap.first->name() == symbol->name()) {
+          dsa.set(symMap.second);
+          break;
+        }
       }
     }
 
     // When handling each implicit rule for a given symbol, one of the
     // following 3 actions may be taken:
     // 1. Declare a new private symbol.
-    // 2. Create a new association symbol with no flags, that will represent
-    //    a shared symbol in the current scope. Note that symbols without
-    //    any private flags are considered as shared.
-    // 3. Use the last declared private symbol, by inserting a new symbol
-    //    in the scope being processed, associated with it.
-    //    If no private symbol was declared previously, then no association
-    //    is needed and the symbol from the enclosing scope will be
-    //    inherited by the current one.
+    // 2. Declare a new shared symbol.
+    // 3. Use the last declared symbol, by inserting a new symbol in the
+    //    scope being processed, associated with it.
+    //    If no symbol was declared previously, then no association is needed
+    //    and the symbol from the enclosing scope will be inherited by the
+    //    current one.
     //
     // Because of how symbols are collected in lowering, not inserting a new
     // symbol in the last case could lead to the conclusion that a symbol
@@ -2231,17 +2271,20 @@ void OmpAttributeVisitor::CreateImplicitSymbols(
     // it would have the private flag set.
     // This would make x appear to be defined in p2, causing it to be
     // privatized in p2 and its privatization in p1 to be skipped.
-    auto makePrivateSymbol = [&](Symbol::Flag flag) {
+    auto makePrivateSymbol = [&](Symbol::Flags flags) {
       const Symbol *hostSymbol =
           lastDeclSymbol ? lastDeclSymbol : &symbol->GetUltimate();
+      assert(flags.LeastElement());
+      Symbol::Flag flag = *flags.LeastElement();
       lastDeclSymbol = DeclareNewPrivateAccessEntity(
           *hostSymbol, flag, context_.FindScope(dirContext.directiveSource));
+      lastDeclSymbol->flags() |= flags;
       if (setFlag) {
         lastDeclSymbol->set(*setFlag);
       }
       return lastDeclSymbol;
     };
-    auto makeSharedSymbol = [&](std::optional<Symbol::Flag> flag = {}) {
+    auto makeAssocSymbol = [&](std::optional<Symbol::Flag> flag = {}) {
       const Symbol *hostSymbol =
           lastDeclSymbol ? lastDeclSymbol : &symbol->GetUltimate();
       Symbol &assocSymbol = MakeAssocSymbol(symbol->name(), *hostSymbol,
@@ -2249,27 +2292,56 @@ void OmpAttributeVisitor::CreateImplicitSymbols(
       if (flag) {
         assocSymbol.set(*flag);
       }
+      return &assocSymbol;
+    };
+    auto makeSharedSymbol = [&]() {
+      lastDeclSymbol = makeAssocSymbol(Symbol::Flag::OmpShared);
+      return lastDeclSymbol;
     };
     auto useLastDeclSymbol = [&]() {
       if (lastDeclSymbol) {
-        makeSharedSymbol();
+        makeAssocSymbol();
       }
     };
+
+#ifndef NDEBUG
+  auto printImplicitRule = [&](const char *id) {
+    if (!llvm::DebugFlag || !llvm::isCurrentDebugType(DEBUG_TYPE)) {
+      return;
+    }
+    llvm::dbgs() << "\t" << id << ": dsa: " << dsa << '\n';
+    llvm::dbgs() << "\t\tScope: " << dbg::ScopeSourcePos(scope) << '\n';
+  };
+
+#define PRINT_IMPLICIT_RULE(id) printImplicitRule(id)
+#else
+#define PRINT_IMPLICIT_RULE(id) do { } while(false)
+#endif
 
     bool taskGenDir = llvm::omp::taskGeneratingSet.test(dirContext.directive);
     bool targetDir = llvm::omp::allTargetSet.test(dirContext.directive);
     bool parallelDir = llvm::omp::allParallelSet.test(dirContext.directive);
     bool teamsDir = llvm::omp::allTeamsSet.test(dirContext.directive);
 
-    if (dsa.has_value()) {
-      if (dsa.value() == Symbol::Flag::OmpShared &&
-          (parallelDir || taskGenDir || teamsDir)) {
-        makeSharedSymbol(Symbol::Flag::OmpShared);
+    if (dsa.any()) {
+      if (parallelDir || taskGenDir || teamsDir) {
+        // NOTE As 'dsa' will match that of the symbol in the current scope
+        //      (if any), we won't override the DSA of any existing symbol.
+        if (dsa.test(Symbol::Flag::OmpShared)) {
+          makeSharedSymbol();
+        } else if ((dsa & privateDataSharingAttributeFlags).any()) {
+          makePrivateSymbol(dsa);
+        }
       }
-      // Private symbols will have been declared already.
       prevDSA = dsa;
+      PRINT_IMPLICIT_RULE("0) already has DSA");
       continue;
     }
+
+    // NOTE Because of how lowering uses OmpImplicit flag, we can only set it
+    //      for symbols with private DSA.
+    //      Also, as default is handled separatly in lowering, don't mark its
+    //      symbols with OmpImplicit too.
 
     if (dirContext.defaultDSA == Symbol::Flag::OmpPrivate ||
         dirContext.defaultDSA == Symbol::Flag::OmpFirstPrivate ||
@@ -2280,32 +2352,37 @@ void OmpAttributeVisitor::CreateImplicitSymbols(
         return;
       }
       if (dirContext.defaultDSA != Symbol::Flag::OmpShared) {
-        makePrivateSymbol(dirContext.defaultDSA);
+        makePrivateSymbol({dirContext.defaultDSA});
       } else {
         makeSharedSymbol();
       }
-      dsa = dirContext.defaultDSA;
+      dsa = {dirContext.defaultDSA};
+      PRINT_IMPLICIT_RULE("1) default");
     } else if (parallelDir) {
       // 2) parallel -> shared
       makeSharedSymbol();
-      dsa = Symbol::Flag::OmpShared;
+      dsa = {Symbol::Flag::OmpShared};
+      PRINT_IMPLICIT_RULE("2) parallel");
     } else if (!taskGenDir && !targetDir) {
       // 3) enclosing context
       useLastDeclSymbol();
       dsa = prevDSA;
+      PRINT_IMPLICIT_RULE("3) enclosing context");
     } else if (targetDir) {
       // TODO 4) not mapped target variable -> firstprivate
       dsa = prevDSA;
     } else if (taskGenDir) {
       // TODO 5) dummy arg in orphaned taskgen construct -> firstprivate
-      if (prevDSA == Symbol::Flag::OmpShared) {
+      if (prevDSA.test(Symbol::Flag::OmpShared)) {
         // 6) shared in enclosing context -> shared
         makeSharedSymbol();
-        dsa = Symbol::Flag::OmpShared;
+        dsa = {Symbol::Flag::OmpShared};
+        PRINT_IMPLICIT_RULE("6) taskgen: shared");
       } else {
         // 7) firstprivate
-        dsa = Symbol::Flag::OmpFirstPrivate;
-        makePrivateSymbol(*dsa)->set(Symbol::Flag::OmpImplicit);
+        dsa = {Symbol::Flag::OmpFirstPrivate};
+        makePrivateSymbol(dsa)->set(Symbol::Flag::OmpImplicit);
+        PRINT_IMPLICIT_RULE("7) taskgen: firstprivate");
       }
     }
     prevDSA = dsa;
@@ -2371,7 +2448,7 @@ void OmpAttributeVisitor::ResolveOmpName(
   if (ResolveName(&name)) {
     if (auto *resolvedSymbol{ResolveOmp(name, ompFlag, currScope())}) {
       if (dataSharingAttributeFlags.test(ompFlag)) {
-        AddToContextObjectWithDSA(*resolvedSymbol, ompFlag);
+        AddToContextObjectWithExplicitDSA(*resolvedSymbol, ompFlag);
       }
     }
   } else if (ompFlag == Symbol::Flag::OmpCriticalLock) {
@@ -2484,7 +2561,7 @@ void OmpAttributeVisitor::ResolveOmpObject(
                 if (dataCopyingAttributeFlags.test(ompFlag)) {
                   CheckDataCopyingClause(*name, *symbol, ompFlag);
                 } else {
-                  AddToContextObjectWithDSA(*symbol, ompFlag);
+                  AddToContextObjectWithExplicitDSA(*symbol, ompFlag);
                   if (dataSharingAttributeFlags.test(ompFlag)) {
                     CheckMultipleAppearances(*name, *symbol, ompFlag);
                   }
@@ -2588,8 +2665,11 @@ void OmpAttributeVisitor::ResolveOmpObject(
                               GetContext().directive))) {
                     for (Symbol::Flag ompFlag1 : dataMappingAttributeFlags) {
                       for (Symbol::Flag ompFlag2 : dataSharingAttributeFlags) {
-                        checkExclusivelists(
-                            hostAssocSym, ompFlag1, symbol, ompFlag2);
+                        if ((hostAssocSym->test(ompFlag2) && hostAssocSym->test(Symbol::Flag::OmpExplicit)) ||
+                            (symbol->test(ompFlag2) && symbol->test(Symbol::Flag::OmpExplicit))) {
+                          checkExclusivelists(
+                              hostAssocSym, ompFlag1, symbol, ompFlag2);
+                        }
                       }
                     }
                   }
@@ -2624,7 +2704,7 @@ void OmpAttributeVisitor::ResolveOmpObject(
                   if (dataCopyingAttributeFlags.test(ompFlag)) {
                     CheckDataCopyingClause(name, *resolvedObject, ompFlag);
                   } else {
-                    AddToContextObjectWithDSA(*resolvedObject, ompFlag);
+                    AddToContextObjectWithExplicitDSA(*resolvedObject, ompFlag);
                   }
                   details.replace_object(*resolvedObject, index);
                 }
@@ -2831,10 +2911,16 @@ static bool IsSymbolThreadprivate(const Symbol &symbol) {
 }
 
 static bool IsSymbolPrivate(const Symbol &symbol) {
-  if (symbol.test(Symbol::Flag::OmpPrivate) ||
-      symbol.test(Symbol::Flag::OmpFirstPrivate)) {
+  LLVM_DEBUG(llvm::dbgs() << "IsSymbolPrivate:\n");
+  LLVM_DEBUG(dbg::DumpAssocSymbols(symbol));
+
+  if (Symbol::Flags dsa{GetSymbolDSA(symbol)}; dsa.any()) {
+    if (dsa.test(Symbol::Flag::OmpShared)) {
+      return false;
+    }
     return true;
   }
+
   // A symbol that has not gone through constructs that may privatize the
   // original symbol may be predetermined as private.
   // (OMP 5.2 5.1.1 - Variables Referenced in a Construct)
@@ -3080,4 +3166,58 @@ void OmpAttributeVisitor::IssueNonConformanceWarning(
   context_.Warn(common::UsageWarning::OpenMPUsage, source, "%s"_warn_en_US,
       warnStrOS.str());
 }
+
+#ifndef NDEBUG
+
+static llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
+    std::optional<parser::SourcePosition> srcPos) {
+  if (srcPos) {
+    os << *srcPos.value().path << ":" << srcPos.value().line << ": ";
+  }
+  return os;
+}
+
+static llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const Symbol::Flags &flags) {
+  flags.Dump(os, Symbol::EnumToString);
+  return os;
+}
+
+namespace dbg {
+
+static std::optional<parser::SourcePosition>
+GetSourcePosition(const Fortran::semantics::Scope &scope,
+                  const Fortran::parser::CharBlock &src) {
+  parser::AllCookedSources &allCookedSources{
+      scope.context().allCookedSources()};
+  if (std::optional<parser::ProvenanceRange> prange{
+      allCookedSources.GetProvenanceRange(src)}) {
+    return allCookedSources.allSources().GetSourcePosition(prange->start());
+  }
+  return std::nullopt;
+}
+
+static std::string ScopeSourcePos(const Fortran::semantics::Scope &scope)
+{
+  const parser::CharBlock &sourceRange{scope.sourceRange()};
+  std::string src{sourceRange.ToString()};
+  size_t nl{src.find('\n')};
+  std::string str;
+  llvm::raw_string_ostream ss{str};
+
+  ss << GetSourcePosition(scope, sourceRange) << src.substr(0, nl);
+  return str;
+}
+
+static void DumpAssocSymbols(const Symbol &sym) {
+  llvm::dbgs() << sym << '\n';
+  llvm::dbgs() << "\tOwner: " <<  ScopeSourcePos(sym.owner()) << '\n';
+  if (const auto *details{sym.detailsIf<HostAssocDetails>()}) {
+    DumpAssocSymbols(details->symbol());
+  }
+}
+
+} // namespace dbg
+
+#endif
+
 } // namespace Fortran::semantics
