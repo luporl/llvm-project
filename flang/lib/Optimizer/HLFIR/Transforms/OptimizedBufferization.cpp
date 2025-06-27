@@ -787,8 +787,21 @@ llvm::LogicalResult BroadcastAssignBufferization::matchAndRewrite(
   llvm::SmallVector<mlir::Value> extents =
       hlfir::getIndexExtents(loc, builder, shape);
 
-  if (extents.size() > 1 && mlir::isa<fir::BoxType>(lhs.getType())) {
+  if (
+      //false &&
+      lhs.isSimplyContiguous() &&
+      extents.size() > 1 &&
+      (mlir::isa<fir::BoxType>(lhs.getType()) ||
+       mlir::isa<fir::ReferenceType>(lhs.getType()))) {
     // Flat array to use a single copy loop, that can be better optimized.
+
+#if 0
+    llvm::errs() << "LLL: ty: " << lhs.getType() << "\n";
+    llvm::errs() << "LLL: extents:\n";
+    for (const auto &ext : extents)
+      llvm::errs() << "\t" << ext << "\n";
+    llvm::errs() << "LLL: shape: " << shape << "\n";
+#endif
 
     // Get n, flat extents and shape
     mlir::Value n = extents[0];
@@ -798,19 +811,13 @@ llvm::LogicalResult BroadcastAssignBufferization::matchAndRewrite(
     shape = builder.genShape(loc, extents);
 
     // Convert array value
-    // TODO handle other types of array (that are not a box)
-#if USE_REBOX
-    mlir::Type flatArrayType =
-        fir::BoxType::get(fir::SequenceType::get(eleTy, 1));
-    mlir::Value flatArray = builder.create<fir::ReboxOp>(
-        loc, flatArrayType, lhs.getBase(), shape, mlir::Value{});
-#else
+    // TODO test with allocatable arrays
     mlir::Type flatArrayType =
         fir::ReferenceType::get(fir::SequenceType::get(eleTy, 1));
-    mlir::Value flatArray;
-    flatArray = builder.create<fir::BoxAddrOp>(loc, lhs.getBase());
+    mlir::Value flatArray = lhs.getBase();
+    if (mlir::isa<fir::BoxType>(lhs.getType()))
+      flatArray = builder.create<fir::BoxAddrOp>(loc, flatArray);
     flatArray = builder.createConvert(loc, flatArrayType, flatArray);
-#endif
 
     // gen loop nest
     hlfir::LoopNest loopNest =
