@@ -2400,6 +2400,7 @@ void OmpAttributeVisitor::CreateImplicitSymbols(const Symbol *symbol) {
       lastDeclSymbol->flags() |= flags;
       return lastDeclSymbol;
     };
+    /*
     auto useLastDeclSymbol = [&]() {
       if (lastDeclSymbol) {
         const Symbol *hostSymbol =
@@ -2408,10 +2409,12 @@ void OmpAttributeVisitor::CreateImplicitSymbols(const Symbol *symbol) {
             context_.FindScope(dirContext.directiveSource));
       }
     };
+    */
 
 #ifndef NDEBUG
     auto printImplicitRule = [&](const char *id) {
-      LLVM_DEBUG(llvm::dbgs() << "\t" << id << ": dsa: " << dsa << '\n');
+      LLVM_DEBUG(llvm::dbgs() << "\t" << id << ": dsa: " << dsa
+          << " dir: " << getOpenMPDirectiveName(dirContext.directive) << '\n');
       LLVM_DEBUG(
           llvm::dbgs() << "\t\tScope: " << dbg::ScopeSourcePos(scope) << '\n');
     };
@@ -2475,7 +2478,7 @@ void OmpAttributeVisitor::CreateImplicitSymbols(const Symbol *symbol) {
     } else if (!taskGenDir && !targetDir) {
       // 3) enclosing context
       dsa = prevDSA;
-      useLastDeclSymbol();
+      // useLastDeclSymbol();
       PRINT_IMPLICIT_RULE("3) enclosing context");
     } else if (targetDir) {
       // TODO 4) not mapped target variable -> firstprivate
