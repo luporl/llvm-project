@@ -2362,34 +2362,6 @@ void OmpAttributeVisitor::CreateImplicitSymbols(const Symbol *symbol) {
       }
     }
 
-    // When handling each implicit rule for a given symbol, one of the
-    // following actions may be taken:
-    // 1. Declare a new private or shared symbol.
-    // 2. Use the last declared symbol, by inserting a new symbol in the
-    //    scope being processed, associated with it.
-    //    If no symbol was declared previously, then no association is needed
-    //    and the symbol from the enclosing scope will be inherited by the
-    //    current one.
-    //
-    // Because of how symbols are collected in lowering, not inserting a new
-    // symbol in the second case could lead to the conclusion that a symbol
-    // from an enclosing construct was declared in the current construct,
-    // which would result in wrong privatization code being generated.
-    // Consider the following example:
-    //
-    // !$omp parallel default(private)              ! p1
-    //   !$omp parallel default(private) shared(x)  ! p2
-    //     x = 10
-    //   !$omp end parallel
-    // !$omp end parallel
-    //
-    // If a new x symbol was not inserted in the inner parallel construct
-    // (p2), it would use the x symbol definition from the enclosing scope.
-    // Then, when p2's default symbols were collected in lowering, the x
-    // symbol from the outer parallel construct (p1) would be collected, as
-    // it would have the private flag set.
-    // This would make x appear to be defined in p2, causing it to be
-    // privatized in p2 and its privatization in p1 to be skipped.
     auto makeSymbol = [&](Symbol::Flags flags) {
       const Symbol *hostSymbol =
           lastDeclSymbol ? lastDeclSymbol : &symbol->GetUltimate();
@@ -2400,18 +2372,12 @@ void OmpAttributeVisitor::CreateImplicitSymbols(const Symbol *symbol) {
       lastDeclSymbol->flags() |= flags;
       return lastDeclSymbol;
     };
-    auto useLastDeclSymbol = [&]() {
-      if (lastDeclSymbol) {
-        const Symbol *hostSymbol =
-            lastDeclSymbol ? lastDeclSymbol : &symbol->GetUltimate();
-        MakeAssocSymbol(symbol->name(), *hostSymbol,
-            context_.FindScope(dirContext.directiveSource));
-      }
-    };
 
 #ifndef NDEBUG
     auto printImplicitRule = [&](const char *id) {
-      LLVM_DEBUG(llvm::dbgs() << "\t" << id << ": dsa: " << dsa << '\n');
+      LLVM_DEBUG(llvm::dbgs()
+          << "\t" << id << ": dsa: " << dsa
+          << " dir: " << getOpenMPDirectiveName(dirContext.directive) << '\n');
       LLVM_DEBUG(
           llvm::dbgs() << "\t\tScope: " << dbg::ScopeSourcePos(scope) << '\n');
     };
@@ -2449,13 +2415,6 @@ void OmpAttributeVisitor::CreateImplicitSymbols(const Symbol *symbol) {
       continue;
     }
 
-    // NOTE Because of how lowering uses OmpImplicit flag, we can only set it
-    //      for symbols with private DSA.
-    //      Also, as the default clause is handled separately in lowering,
-    //      don't mark its symbols with OmpImplicit either.
-    //      Ideally, lowering should be changed and all implicit symbols
-    //      should be marked with OmpImplicit.
-
     if (dirContext.defaultDSA == Symbol::Flag::OmpPrivate ||
         dirContext.defaultDSA == Symbol::Flag::OmpFirstPrivate ||
         dirContext.defaultDSA == Symbol::Flag::OmpShared) {
@@ -2465,17 +2424,16 @@ void OmpAttributeVisitor::CreateImplicitSymbols(const Symbol *symbol) {
         return;
       }
       dsa = {dirContext.defaultDSA};
-      makeSymbol(dsa);
+      makeSymbol(dsa)->set(Symbol::Flag::OmpImplicit);
       PRINT_IMPLICIT_RULE("1) default");
     } else if (parallelDir) {
       // 2) parallel -> shared
       dsa = {Symbol::Flag::OmpShared};
-      makeSymbol(dsa);
+      makeSymbol(dsa)->set(Symbol::Flag::OmpImplicit);
       PRINT_IMPLICIT_RULE("2) parallel");
     } else if (!taskGenDir && !targetDir) {
       // 3) enclosing context
       dsa = prevDSA;
-      useLastDeclSymbol();
       PRINT_IMPLICIT_RULE("3) enclosing context");
     } else if (targetDir) {
       // TODO 4) not mapped target variable -> firstprivate
@@ -2487,7 +2445,7 @@ void OmpAttributeVisitor::CreateImplicitSymbols(const Symbol *symbol) {
               (prevDSA & dataSharingAttributeFlags).none())) {
         // 6) shared in enclosing context -> shared
         dsa = {Symbol::Flag::OmpShared};
-        makeSymbol(dsa);
+        makeSymbol(dsa)->set(Symbol::Flag::OmpImplicit);
         PRINT_IMPLICIT_RULE("6) taskgen: shared");
       } else {
         // 7) firstprivate
