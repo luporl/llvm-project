@@ -2411,7 +2411,9 @@ void OmpAttributeVisitor::CreateImplicitSymbols(const Symbol *symbol) {
 
 #ifndef NDEBUG
     auto printImplicitRule = [&](const char *id) {
-      LLVM_DEBUG(llvm::dbgs() << "\t" << id << ": dsa: " << dsa << '\n');
+      LLVM_DEBUG(llvm::dbgs()
+          << "\t" << id << ": dsa: " << dsa
+          << " dir: " << getOpenMPDirectiveName(dirContext.directive) << '\n');
       LLVM_DEBUG(
           llvm::dbgs() << "\t\tScope: " << dbg::ScopeSourcePos(scope) << '\n');
     };
@@ -2449,13 +2451,6 @@ void OmpAttributeVisitor::CreateImplicitSymbols(const Symbol *symbol) {
       continue;
     }
 
-    // NOTE Because of how lowering uses OmpImplicit flag, we can only set it
-    //      for symbols with private DSA.
-    //      Also, as the default clause is handled separately in lowering,
-    //      don't mark its symbols with OmpImplicit either.
-    //      Ideally, lowering should be changed and all implicit symbols
-    //      should be marked with OmpImplicit.
-
     if (dirContext.defaultDSA == Symbol::Flag::OmpPrivate ||
         dirContext.defaultDSA == Symbol::Flag::OmpFirstPrivate ||
         dirContext.defaultDSA == Symbol::Flag::OmpShared) {
@@ -2465,12 +2460,12 @@ void OmpAttributeVisitor::CreateImplicitSymbols(const Symbol *symbol) {
         return;
       }
       dsa = {dirContext.defaultDSA};
-      makeSymbol(dsa);
+      makeSymbol(dsa)->set(Symbol::Flag::OmpImplicit);
       PRINT_IMPLICIT_RULE("1) default");
     } else if (parallelDir) {
       // 2) parallel -> shared
       dsa = {Symbol::Flag::OmpShared};
-      makeSymbol(dsa);
+      makeSymbol(dsa)->set(Symbol::Flag::OmpImplicit);
       PRINT_IMPLICIT_RULE("2) parallel");
     } else if (!taskGenDir && !targetDir) {
       // 3) enclosing context
@@ -2487,7 +2482,7 @@ void OmpAttributeVisitor::CreateImplicitSymbols(const Symbol *symbol) {
               (prevDSA & dataSharingAttributeFlags).none())) {
         // 6) shared in enclosing context -> shared
         dsa = {Symbol::Flag::OmpShared};
-        makeSymbol(dsa);
+        makeSymbol(dsa)->set(Symbol::Flag::OmpImplicit);
         PRINT_IMPLICIT_RULE("6) taskgen: shared");
       } else {
         // 7) firstprivate

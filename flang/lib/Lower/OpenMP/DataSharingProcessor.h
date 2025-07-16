@@ -78,10 +78,6 @@ private:
   mlir::OpBuilder::InsertPoint lastPrivIP;
   llvm::SmallVector<mlir::Value> loopIVs;
   // Symbols in private, firstprivate, and/or lastprivate clauses.
-  llvm::SetVector<const semantics::Symbol *> explicitlyPrivatizedSymbols;
-  llvm::SetVector<const semantics::Symbol *> defaultSymbols;
-  llvm::SetVector<const semantics::Symbol *> implicitSymbols;
-  llvm::SetVector<const semantics::Symbol *> preDeterminedSymbols;
   llvm::SetVector<const semantics::Symbol *> allPrivatizedSymbols;
 
   lower::AbstractConverter &converter;
@@ -106,9 +102,6 @@ private:
       llvm::SetVector<const semantics::Symbol *> &symbolSet);
   void collectSymbolsForPrivatization();
   void insertBarrier(mlir::omp::PrivateClauseOps *clauseOps);
-  void collectDefaultSymbols();
-  void collectImplicitSymbols();
-  void collectPreDeterminedSymbols();
   void privatize(mlir::omp::PrivateClauseOps *clauseOps);
   void copyLastPrivatize(mlir::Operation *op);
   void insertLastPrivateCompare(mlir::Operation *op);
