@@ -35,12 +35,12 @@ subroutine test_do
  do i=1,5
   !DEF: /test_do/OtherConstruct1/OtherConstruct1/j (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
   do j=6,10
-   !DEF: /test_do/OtherConstruct1/OtherConstruct1/a HostAssoc REAL(4)
+   !DEF: /test_do/OtherConstruct1/a (OmpShared, OmpImplicit) HostAssoc REAL(4)
    a(1,1,1) = 0.
    !DEF: /test_do/OtherConstruct1/k (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
    do k=11,15
-    !REF: /test_do/OtherConstruct1/OtherConstruct1/a
-    !DEF: /test_do/OtherConstruct1/OtherConstruct1/k HostAssoc INTEGER(4)
+    !REF: /test_do/OtherConstruct1/a
+    !REF: /test_do/OtherConstruct1/k
     !REF: /test_do/OtherConstruct1/OtherConstruct1/j
     !REF: /test_do/OtherConstruct1/OtherConstruct1/i
     a(k,j,i) = 1.

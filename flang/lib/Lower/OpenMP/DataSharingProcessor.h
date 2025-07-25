@@ -32,49 +32,6 @@ namespace omp {
 
 class DataSharingProcessor {
 private:
-  /// A symbol visitor that keeps track of the currently active OpenMPConstruct
-  /// at any point in time. This is used to track Symbol definition scopes in
-  /// order to tell which OMP scope defined vs. references a certain Symbol.
-  struct OMPConstructSymbolVisitor {
-    OMPConstructSymbolVisitor(semantics::SemanticsContext &ctx)
-        : version(ctx.langOptions().OpenMPVersion) {}
-    template <typename T>
-    bool Pre(const T &) {
-      return true;
-    }
-    template <typename T>
-    void Post(const T &) {}
-
-    bool Pre(const parser::OpenMPConstruct &omp) {
-      // Skip constructs that may not have privatizations.
-      if (isOpenMPPrivatizingConstruct(omp, version))
-        constructs.push_back(&omp);
-      return true;
-    }
-
-    void Post(const parser::OpenMPConstruct &omp) {
-      if (isOpenMPPrivatizingConstruct(omp, version))
-        constructs.pop_back();
-    }
-
-    void Post(const parser::Name &name) {
-      auto *current = !constructs.empty() ? constructs.back() : nullptr;
-      symDefMap.try_emplace(name.symbol, current);
-    }
-
-    llvm::SmallVector<const parser::OpenMPConstruct *> constructs;
-    llvm::DenseMap<semantics::Symbol *, const parser::OpenMPConstruct *>
-        symDefMap;
-
-    /// Given a \p symbol and an \p eval, returns true if eval is the OMP
-    /// construct that defines symbol.
-    bool isSymbolDefineBy(const semantics::Symbol *symbol,
-                          lower::pft::Evaluation &eval) const;
-
-  private:
-    unsigned version;
-  };
-
   mlir::OpBuilder::InsertPoint lastPrivIP;
   llvm::SmallVector<mlir::Value> loopIVs;
   // Symbols in private, firstprivate, and/or lastprivate clauses.
@@ -89,7 +46,6 @@ private:
   bool useDelayedPrivatization;
   llvm::SmallSet<const semantics::Symbol *, 16> mightHaveReadHostSym;
   lower::SymMap &symTable;
-  OMPConstructSymbolVisitor visitor;
 
   bool needBarrier();
   void collectSymbols(semantics::Symbol::Flag flag,
@@ -116,6 +72,8 @@ private:
   static bool isOpenMPPrivatizingConstruct(const parser::OpenMPConstruct &omp,
                                            unsigned version);
   bool isOpenMPPrivatizingEvaluation(const pft::Evaluation &eval) const;
+
+  const semantics::Scope *getCurrentScope() const;
 
 public:
   DataSharingProcessor(lower::AbstractConverter &converter,

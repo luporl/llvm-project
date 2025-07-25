@@ -36,15 +36,6 @@
 namespace Fortran {
 namespace lower {
 namespace omp {
-bool DataSharingProcessor::OMPConstructSymbolVisitor::isSymbolDefineBy(
-    const semantics::Symbol *symbol, lower::pft::Evaluation &eval) const {
-  return eval.visit(
-      common::visitors{[&](const parser::OpenMPConstruct &functionParserNode) {
-                         return symDefMap.count(symbol) &&
-                                symDefMap.at(symbol) == &functionParserNode;
-                       },
-                       [](const auto &functionParserNode) { return false; }});
-}
 
 DataSharingProcessor::DataSharingProcessor(
     lower::AbstractConverter &converter, semantics::SemanticsContext &semaCtx,
@@ -54,12 +45,7 @@ DataSharingProcessor::DataSharingProcessor(
     : converter(converter), semaCtx(semaCtx),
       firOpBuilder(converter.getFirOpBuilder()), clauses(clauses), eval(eval),
       shouldCollectPreDeterminedSymbols(shouldCollectPreDeterminedSymbols),
-      useDelayedPrivatization(useDelayedPrivatization), symTable(symTable),
-      visitor(semaCtx) {
-  eval.visit([&](const auto &functionParserNode) {
-    parser::Walk(functionParserNode, visitor);
-  });
-}
+      useDelayedPrivatization(useDelayedPrivatization), symTable(symTable) {}
 
 DataSharingProcessor::DataSharingProcessor(lower::AbstractConverter &converter,
                                            semantics::SemanticsContext &semaCtx,
@@ -206,26 +192,106 @@ void DataSharingProcessor::collectOmpObjectListSymbol(
     symbolSet.insert(object.sym());
 }
 
+static const parser::CharBlock *
+getSource(const semantics::SemanticsContext &semaCtx,
+          const lower::pft::Evaluation &eval) {
+  const parser::CharBlock *source = nullptr;
+
+  auto ompConsVisit = [&](const parser::OpenMPConstruct &x) {
+    std::visit(
+        common::visitors{
+            [&](const parser::OpenMPSectionsConstruct &x) {
+              source = &std::get<0>(x.t).source;
+            },
+            [&](const parser::OpenMPLoopConstruct &x) {
+              source = &std::get<0>(x.t).source;
+            },
+            [&](const parser::OpenMPBlockConstruct &x) {
+              source = &std::get<0>(x.t).source;
+            },
+            [&](const parser::OpenMPCriticalConstruct &x) {
+              source = &std::get<0>(x.t).source;
+            },
+            [&](const parser::OpenMPAtomicConstruct &x) {
+              source = &std::get<parser::OmpDirectiveSpecification>(x.t).source;
+            },
+            [&](const auto &x) { source = &x.source; },
+        },
+        x.u);
+  };
+
+  eval.visit(common::visitors{
+      [&](const parser::OpenMPConstruct &x) { ompConsVisit(x); },
+      [&](const parser::OpenMPDeclarativeConstruct &x) { source = &x.source; },
+      [&](const parser::OmpEndLoopDirective &x) { source = &x.source; },
+      [&](const auto &x) {},
+  });
+
+  return source;
+}
+
+static std::optional<llvm::omp::Directive>
+getDirective(lower::pft::Evaluation &eval) {
+  return eval.visit([=](auto &&s) -> std::optional<llvm::omp::Directive> {
+    using BareS = llvm::remove_cvref_t<decltype(s)>;
+    if constexpr (std::is_same_v<BareS, parser::OpenMPConstruct>) {
+      return extractOmpDirective(s);
+    } else {
+      return std::nullopt;
+    }
+  });
+}
+
+const semantics::Scope *DataSharingProcessor::getCurrentScope() const {
+  const parser::CharBlock *source =
+      clauses.empty() ? getSource(semaCtx, eval) : &clauses.front().source;
+  return source && !source->empty() ? &semaCtx.FindScope(*source) : nullptr;
+}
+
+static const semantics::Symbol *
+getCurScopeSymbolAncestorRec(const semantics::Scope *curScope,
+                             const semantics::Symbol *sym) {
+  // Get parent (HostAssoc) symbol
+  const semantics::Symbol *parent = nullptr;
+  if (const auto *details =
+          sym->detailsIf<Fortran::semantics::HostAssocDetails>())
+    parent = &details->symbol();
+  if (!parent)
+    return nullptr;
+
+  if (parent->owner() == *curScope)
+    return parent;
+  return getCurScopeSymbolAncestorRec(curScope, parent);
+}
+
+static const semantics::Symbol *
+getCurScopeSymbolAncestor(const semantics::Scope *curScope,
+                          const semantics::Symbol *sym) {
+  if (curScope == nullptr || sym->owner() == *curScope)
+    // Same scope
+    return nullptr;
+  return getCurScopeSymbolAncestorRec(curScope, sym);
+}
+
 void DataSharingProcessor::collectSymbolsForPrivatization() {
   using namespace Fortran::semantics;
 
-#ifndef NDEBUG
-  // Get directive
-  std::optional<llvm::omp::Directive> dir =
-      eval.visit([=](auto &&s) -> std::optional<llvm::omp::Directive> {
-        using BareS = llvm::remove_cvref_t<decltype(s)>;
-        if constexpr (std::is_same_v<BareS, parser::OpenMPConstruct>) {
-          return extractOmpDirective(s);
-        } else {
-          return std::nullopt;
-        }
-      });
+  std::optional<llvm::omp::Directive> currentDirective = getDirective(eval);
 
-  // Get directive name
+#ifndef NDEBUG
   std::string directiveName =
-      dir ? std::string(llvm::omp::getOpenMPDirectiveName(
-                *dir, semaCtx.langOptions().OpenMPVersion))
+      currentDirective
+          ? std::string(llvm::omp::getOpenMPDirectiveName(
+                *currentDirective, semaCtx.langOptions().OpenMPVersion))
           : "";
+
+  auto dbg = [&]() -> llvm::raw_ostream & {
+    return llvm::dbgs() << "collectSymbolsForPrivatization(" << directiveName
+                        << "): ";
+  };
+
+  LLVM_DEBUG(dbg() << "eval:\n");
+  LLVM_DEBUG(eval.dump());
 #endif
 
   llvm::SetVector<const Symbol *> explicitSymbols;
@@ -307,9 +373,10 @@ void DataSharingProcessor::collectSymbolsForPrivatization() {
     if (sym->test(Symbol::Flag::OmpImplicit)) {
       if (hasDefaultClause)
         return true;
-      if (dir && llvm::omp::isLeafConstruct(*dir))
+      if (currentDirective && llvm::omp::isLeafConstruct(*currentDirective))
         return true;
-      if (dir && llvm::omp::taskGeneratingSet.test(*dir))
+      if (currentDirective &&
+          llvm::omp::taskGeneratingSet.test(*currentDirective))
         return true;
       return false;
     }
@@ -353,9 +420,26 @@ void DataSharingProcessor::collectSymbolsForPrivatization() {
 
   collect(Symbol::Flag::OmpPreDetermined);
 
+  // Handle symbols that are shared in nested regions, but private in the
+  // enclosing context.
+
+  // Get nested shared symbols.
+  symbols.clear();
+  collectSymbolsInNestedRegions(eval, Symbol::Flag::OmpShared, symbols);
+
+  for (auto *sym : symbols) {
+    const Symbol *ancestor = getCurScopeSymbolAncestor(getCurrentScope(), sym);
+    if (ancestor && ancestor->test(Symbol::Flag::OmpImplicit) &&
+        !ancestor->test(Symbol::Flag::OmpShared)) {
+      // This may result in additional privatization for non-immediate children,
+      // but at least is correct.
+      LLVM_DEBUG(dbg() << "shared_exception: " << *ancestor);
+      allPrivatizedSymbols.insert(ancestor);
+    }
+  }
+
 #ifndef NDEBUG
-  LLVM_DEBUG(llvm::dbgs() << "collectSymbolsForPrivatization: " << directiveName
-                          << "\n");
+  LLVM_DEBUG(dbg() << "symbols to be privatized:\n");
   for (auto *sym : allPrivatizedSymbols)
     LLVM_DEBUG(llvm::dbgs() << "\t" << *sym << "\n");
 #endif
@@ -482,44 +566,6 @@ void DataSharingProcessor::insertLastPrivateCompare(mlir::Operation *op) {
   }
 }
 
-static const parser::CharBlock *
-getSource(const semantics::SemanticsContext &semaCtx,
-          const lower::pft::Evaluation &eval) {
-  const parser::CharBlock *source = nullptr;
-
-  auto ompConsVisit = [&](const parser::OpenMPConstruct &x) {
-    std::visit(
-        common::visitors{
-            [&](const parser::OpenMPSectionsConstruct &x) {
-              source = &std::get<0>(x.t).source;
-            },
-            [&](const parser::OpenMPLoopConstruct &x) {
-              source = &std::get<0>(x.t).source;
-            },
-            [&](const parser::OpenMPBlockConstruct &x) {
-              source = &std::get<0>(x.t).source;
-            },
-            [&](const parser::OpenMPCriticalConstruct &x) {
-              source = &std::get<0>(x.t).source;
-            },
-            [&](const parser::OpenMPAtomicConstruct &x) {
-              source = &std::get<parser::OmpDirectiveSpecification>(x.t).source;
-            },
-            [&](const auto &x) { source = &x.source; },
-        },
-        x.u);
-  };
-
-  eval.visit(common::visitors{
-      [&](const parser::OpenMPConstruct &x) { ompConsVisit(x); },
-      [&](const parser::OpenMPDeclarativeConstruct &x) { source = &x.source; },
-      [&](const parser::OmpEndLoopDirective &x) { source = &x.source; },
-      [&](const auto &x) {},
-  });
-
-  return source;
-}
-
 static void collectPrivatizingConstructs(
     llvm::SmallSet<llvm::omp::Directive, 16> &constructs, unsigned version) {
   using Clause = llvm::omp::Clause;
@@ -575,6 +621,8 @@ bool DataSharingProcessor::isOpenMPPrivatizingEvaluation(
   });
 }
 
+#define DBG_NESTED_EVALS 0
+
 void DataSharingProcessor::collectSymbolsInNestedRegions(
     lower::pft::Evaluation &eval, semantics::Symbol::Flag flag,
     llvm::SetVector<const semantics::Symbol *> &symbolsInNestedRegions) {
@@ -582,10 +630,20 @@ void DataSharingProcessor::collectSymbolsInNestedRegions(
     return;
   for (pft::Evaluation &nestedEval : eval.getNestedEvaluations()) {
     if (isOpenMPPrivatizingEvaluation(nestedEval)) {
+#if DBG_NESTED_EVALS
+      LLVM_DEBUG(llvm::dbgs()
+                 << "collectSymbolsInNestedRegions: nestedEval: isPriv\n");
+      LLVM_DEBUG(nestedEval.dump());
+#endif
       converter.collectSymbolSet(nestedEval, symbolsInNestedRegions, flag,
                                  /*collectSymbols=*/true,
                                  /*collectHostAssociatedSymbols=*/false);
     } else {
+#if DBG_NESTED_EVALS
+      LLVM_DEBUG(llvm::dbgs()
+                 << "collectSymbolsInNestedRegions: nestedEval: !isPriv\n");
+      LLVM_DEBUG(nestedEval.dump());
+#endif
       // Recursively look for OpenMP constructs within `nestedEval`'s region
       collectSymbolsInNestedRegions(nestedEval, flag, symbolsInNestedRegions);
     }
@@ -602,34 +660,37 @@ void DataSharingProcessor::collectSymbolsInNestedRegions(
 void DataSharingProcessor::collectSymbols(
     semantics::Symbol::Flag flag,
     llvm::SetVector<const semantics::Symbol *> &symbols) {
-  // Collect all scopes associated with 'eval'.
-  llvm::SetVector<const semantics::Scope *> clauseScopes;
-  std::function<void(const semantics::Scope *)> collectScopes =
-      [&](const semantics::Scope *scope) {
-        clauseScopes.insert(scope);
-        for (const semantics::Scope &child : scope->children())
-          collectScopes(&child);
-      };
-  const parser::CharBlock *source =
-      clauses.empty() ? getSource(semaCtx, eval) : &clauses.front().source;
-  const semantics::Scope *curScope = nullptr;
-  if (source && !source->empty()) {
-    curScope = &semaCtx.FindScope(*source);
-    collectScopes(curScope);
-  }
+  const semantics::Scope *curScope = getCurrentScope();
   // Collect all symbols referenced in the evaluation being processed,
   // that matches 'flag'.
   llvm::SetVector<const semantics::Symbol *> allSymbols;
   converter.collectSymbolSet(eval, allSymbols, flag,
                              /*collectSymbols=*/true,
-                             /*collectHostAssociatedSymbols=*/true);
+                             /*collectHostAssociatedSymbols=*/false);
+
+#ifndef NDEBUG
+  auto dbg = [&]() -> llvm::raw_ostream & {
+    return llvm::dbgs() << "collectSymbols("
+                        << semantics::Symbol::EnumToString(flag) << "): ";
+  };
+
+  auto dumpSymbols =
+      [&](const llvm::SetVector<const semantics::Symbol *> &symbols) {
+        for (const auto *sym : symbols)
+          LLVM_DEBUG(llvm::dbgs() << "\t" << *sym << " - " << sym << "\n");
+      };
+
+  LLVM_DEBUG(dbg() << "allSymbols:\n");
+  dumpSymbols(allSymbols);
+#endif
 
   llvm::SetVector<const semantics::Symbol *> symbolsInNestedRegions;
   collectSymbolsInNestedRegions(eval, flag, symbolsInNestedRegions);
 
-  for (auto *symbol : allSymbols)
-    if (visitor.isSymbolDefineBy(symbol, eval))
-      symbolsInNestedRegions.remove(symbol);
+#ifndef NDEBUG
+  LLVM_DEBUG(dbg() << "symbolsInNestedRegions:\n");
+  dumpSymbols(symbolsInNestedRegions);
+#endif
 
   // Filter-out symbols that must not be privatized.
   auto isPrivatizable = [](const semantics::Symbol &sym) -> bool {
@@ -643,9 +704,20 @@ void DataSharingProcessor::collectSymbols(
 
   for (const auto *sym : allSymbols) {
     assert(curScope && "couldn't find current scope");
-    if (isPrivatizable(*sym) && !symbolsInNestedRegions.contains(sym) &&
-        clauseScopes.contains(&sym->owner())) {
+    // || sym->owner() == *curScope is needed because:
+    // Some constructs in the same directive may be nested, e.g.:
+    // omp parallel
+    //   do i = 1, 10
+    // ...
+    // i is in a nested eval
+    if (isPrivatizable(*sym) && sym->owner() == *curScope) {
       symbols.insert(sym);
+    } else {
+      if (!symbolsInNestedRegions.contains(sym)) {
+        LLVM_DEBUG(dbg() << "filtered-out: "
+                         << "priv: " << isPrivatizable(*sym) << "  " << *sym
+                         << "\n");
+      }
     }
   }
 }

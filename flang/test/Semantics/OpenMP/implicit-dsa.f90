@@ -150,8 +150,8 @@ subroutine implicit_dsa_test7
 
   !$omp task
     !$omp taskgroup
-      !DEF: /implicit_dsa_test7/OtherConstruct1/OtherConstruct1/x HostAssoc INTEGER(4)
-      !DEF: /implicit_dsa_test7/OtherConstruct1/OtherConstruct1/y HostAssoc INTEGER(4)
+      !DEF: /implicit_dsa_test7/OtherConstruct1/x (OmpFirstPrivate, OmpImplicit) HostAssoc INTEGER(4)
+      !DEF: /implicit_dsa_test7/OtherConstruct1/y (OmpFirstPrivate, OmpImplicit) HostAssoc INTEGER(4)
       x = y
     !$omp end taskgroup
   !$omp end task
