@@ -277,23 +277,6 @@ void DataSharingProcessor::collectSymbolsForPrivatization() {
   using namespace Fortran::semantics;
 
   std::optional<llvm::omp::Directive> currentDirective = getDirective(eval);
-
-#ifndef NDEBUG
-  std::string directiveName =
-      currentDirective
-          ? std::string(llvm::omp::getOpenMPDirectiveName(
-                *currentDirective, semaCtx.langOptions().OpenMPVersion))
-          : "";
-
-  auto dbg = [&]() -> llvm::raw_ostream & {
-    return llvm::dbgs() << "collectSymbolsForPrivatization(" << directiveName
-                        << "): ";
-  };
-
-  LLVM_DEBUG(dbg() << "eval:\n");
-  LLVM_DEBUG(eval.dump());
-#endif
-
   llvm::SetVector<const Symbol *> explicitSymbols;
   llvm::SetVector<const Symbol *> symbols;
   bool hasDefaultClause = false;
@@ -430,19 +413,11 @@ void DataSharingProcessor::collectSymbolsForPrivatization() {
   for (auto *sym : symbols) {
     const Symbol *ancestor = getCurScopeSymbolAncestor(getCurrentScope(), sym);
     if (ancestor && ancestor->test(Symbol::Flag::OmpImplicit) &&
-        !ancestor->test(Symbol::Flag::OmpShared)) {
+        !ancestor->test(Symbol::Flag::OmpShared))
       // This may result in additional privatization for non-immediate children,
       // but at least is correct.
-      LLVM_DEBUG(dbg() << "shared_exception: " << *ancestor);
       allPrivatizedSymbols.insert(ancestor);
-    }
   }
-
-#ifndef NDEBUG
-  LLVM_DEBUG(dbg() << "symbols to be privatized:\n");
-  for (auto *sym : allPrivatizedSymbols)
-    LLVM_DEBUG(llvm::dbgs() << "\t" << *sym << "\n");
-#endif
 }
 
 bool DataSharingProcessor::needBarrier() {
@@ -621,8 +596,6 @@ bool DataSharingProcessor::isOpenMPPrivatizingEvaluation(
   });
 }
 
-#define DBG_NESTED_EVALS 0
-
 void DataSharingProcessor::collectSymbolsInNestedRegions(
     lower::pft::Evaluation &eval, semantics::Symbol::Flag flag,
     llvm::SetVector<const semantics::Symbol *> &symbolsInNestedRegions) {
@@ -630,20 +603,10 @@ void DataSharingProcessor::collectSymbolsInNestedRegions(
     return;
   for (pft::Evaluation &nestedEval : eval.getNestedEvaluations()) {
     if (isOpenMPPrivatizingEvaluation(nestedEval)) {
-#if DBG_NESTED_EVALS
-      LLVM_DEBUG(llvm::dbgs()
-                 << "collectSymbolsInNestedRegions: nestedEval: isPriv\n");
-      LLVM_DEBUG(nestedEval.dump());
-#endif
       converter.collectSymbolSet(nestedEval, symbolsInNestedRegions, flag,
                                  /*collectSymbols=*/true,
                                  /*collectHostAssociatedSymbols=*/false);
     } else {
-#if DBG_NESTED_EVALS
-      LLVM_DEBUG(llvm::dbgs()
-                 << "collectSymbolsInNestedRegions: nestedEval: !isPriv\n");
-      LLVM_DEBUG(nestedEval.dump());
-#endif
       // Recursively look for OpenMP constructs within `nestedEval`'s region
       collectSymbolsInNestedRegions(nestedEval, flag, symbolsInNestedRegions);
     }
@@ -668,29 +631,8 @@ void DataSharingProcessor::collectSymbols(
                              /*collectSymbols=*/true,
                              /*collectHostAssociatedSymbols=*/false);
 
-#ifndef NDEBUG
-  auto dbg = [&]() -> llvm::raw_ostream & {
-    return llvm::dbgs() << "collectSymbols("
-                        << semantics::Symbol::EnumToString(flag) << "): ";
-  };
-
-  auto dumpSymbols =
-      [&](const llvm::SetVector<const semantics::Symbol *> &symbols) {
-        for (const auto *sym : symbols)
-          LLVM_DEBUG(llvm::dbgs() << "\t" << *sym << " - " << sym << "\n");
-      };
-
-  LLVM_DEBUG(dbg() << "allSymbols:\n");
-  dumpSymbols(allSymbols);
-#endif
-
   llvm::SetVector<const semantics::Symbol *> symbolsInNestedRegions;
   collectSymbolsInNestedRegions(eval, flag, symbolsInNestedRegions);
-
-#ifndef NDEBUG
-  LLVM_DEBUG(dbg() << "symbolsInNestedRegions:\n");
-  dumpSymbols(symbolsInNestedRegions);
-#endif
 
   // Filter-out symbols that must not be privatized.
   auto isPrivatizable = [](const semantics::Symbol &sym) -> bool {
@@ -710,15 +652,8 @@ void DataSharingProcessor::collectSymbols(
     //   do i = 1, 10
     // ...
     // i is in a nested eval
-    if (isPrivatizable(*sym) && sym->owner() == *curScope) {
+    if (isPrivatizable(*sym) && sym->owner() == *curScope)
       symbols.insert(sym);
-    } else {
-      if (!symbolsInNestedRegions.contains(sym)) {
-        LLVM_DEBUG(dbg() << "filtered-out: "
-                         << "priv: " << isPrivatizable(*sym) << "  " << *sym
-                         << "\n");
-      }
-    }
   }
 }
 
