@@ -2362,13 +2362,16 @@ void OmpAttributeVisitor::CreateImplicitSymbols(const Symbol *symbol) {
       }
     }
 
-    auto makeSymbol = [&](Symbol::Flags flags) {
+    auto makeSymbol = [&](Symbol::Flags flags, bool implicit = true) {
       const Symbol *hostSymbol =
           lastDeclSymbol ? lastDeclSymbol : &symbol->GetUltimate();
       assert(flags.LeastElement());
       Symbol::Flag flag = *flags.LeastElement();
       lastDeclSymbol = DeclareNewAccessEntity(
           *hostSymbol, flag, context_.FindScope(dirContext.directiveSource));
+      if (implicit) {
+        flags |= {Symbol::Flag::OmpImplicit};
+      }
       lastDeclSymbol->flags() |= flags;
       return lastDeclSymbol;
     };
@@ -2398,7 +2401,7 @@ void OmpAttributeVisitor::CreateImplicitSymbols(const Symbol *symbol) {
         // NOTE As `dsa` will match that of the symbol in the current scope
         //      (if any), we won't override the DSA of any existing symbol.
         if ((dsa & dataSharingAttributeFlags).any()) {
-          makeSymbol(dsa);
+          makeSymbol(dsa, /*implicit=*/false);
         }
         // Fix host association of explicit symbols, as they can be created
         // before implicit ones in enclosing scope.
@@ -2424,12 +2427,12 @@ void OmpAttributeVisitor::CreateImplicitSymbols(const Symbol *symbol) {
         return;
       }
       dsa = {dirContext.defaultDSA};
-      makeSymbol(dsa)->set(Symbol::Flag::OmpImplicit);
+      makeSymbol(dsa);
       PRINT_IMPLICIT_RULE("1) default");
     } else if (parallelDir) {
       // 2) parallel -> shared
       dsa = {Symbol::Flag::OmpShared};
-      makeSymbol(dsa)->set(Symbol::Flag::OmpImplicit);
+      makeSymbol(dsa);
       PRINT_IMPLICIT_RULE("2) parallel");
     } else if (!taskGenDir && !targetDir) {
       // 3) enclosing context
@@ -2445,12 +2448,12 @@ void OmpAttributeVisitor::CreateImplicitSymbols(const Symbol *symbol) {
               (prevDSA & dataSharingAttributeFlags).none())) {
         // 6) shared in enclosing context -> shared
         dsa = {Symbol::Flag::OmpShared};
-        makeSymbol(dsa)->set(Symbol::Flag::OmpImplicit);
+        makeSymbol(dsa);
         PRINT_IMPLICIT_RULE("6) taskgen: shared");
       } else {
         // 7) firstprivate
         dsa = {Symbol::Flag::OmpFirstPrivate};
-        makeSymbol(dsa)->set(Symbol::Flag::OmpImplicit);
+        makeSymbol(dsa);
         PRINT_IMPLICIT_RULE("7) taskgen: firstprivate");
       }
     }

@@ -29,10 +29,6 @@
 #include "llvm/ADT/Sequence.h"
 #include "llvm/ADT/SmallSet.h"
 
-#ifndef NDEBUG
-#define DEBUG_TYPE "omp"
-#endif
-
 namespace Fortran {
 namespace lower {
 namespace omp {
@@ -251,7 +247,6 @@ const semantics::Scope *DataSharingProcessor::getCurrentScope() const {
 static const semantics::Symbol *
 getCurScopeSymbolAncestorRec(const semantics::Scope *curScope,
                              const semantics::Symbol *sym) {
-  // Get parent (HostAssoc) symbol
   const semantics::Symbol *parent = nullptr;
   if (const auto *details =
           sym->detailsIf<Fortran::semantics::HostAssocDetails>())
@@ -264,11 +259,11 @@ getCurScopeSymbolAncestorRec(const semantics::Scope *curScope,
   return getCurScopeSymbolAncestorRec(curScope, parent);
 }
 
+// Get the ancestor of `sym` in the current scope, if any.
 static const semantics::Symbol *
 getCurScopeSymbolAncestor(const semantics::Scope *curScope,
                           const semantics::Symbol *sym) {
   if (curScope == nullptr || sym->owner() == *curScope)
-    // Same scope
     return nullptr;
   return getCurScopeSymbolAncestorRec(curScope, sym);
 }
@@ -278,12 +273,12 @@ void DataSharingProcessor::collectSymbolsForPrivatization() {
 
   std::optional<llvm::omp::Directive> currentDirective = getDirective(eval);
   llvm::SetVector<const Symbol *> explicitSymbols;
-  llvm::SetVector<const Symbol *> symbols;
   bool hasDefaultClause = false;
 
-  // Collect explicitly privatized symbols.
+  // Collect explicitly privatized symbols from clauses.
   // This is needed for combined/composite constructs, in order to identify
-  // which directive should privatize each symbol.
+  // which directive should privatize which symbol.
+  // It is also needed for symbols that are not referenced in the construct.
   for (const omp::Clause &clause : clauses) {
     if (const auto &privateClause =
             std::get_if<omp::clause::Private>(&clause.u)) {
@@ -302,8 +297,8 @@ void DataSharingProcessor::collectSymbolsForPrivatization() {
     }
   }
 
-  // Filter symbols for privatization, leaving only those that must be
-  // privatized by the current construct.
+  // Filter symbols, leaving only those that must be privatized by the
+  // current construct.
   auto shouldCollectSymbol = [&](const Symbol *sym) -> bool {
     // Always skip shared symbols.
     if (sym->test(Symbol::Flag::OmpShared))
@@ -331,8 +326,8 @@ void DataSharingProcessor::collectSymbolsForPrivatization() {
     // (i.e. %linear) to its `uses` in the BB to correctly
     // implement the functionalities of linear clause. However,
     // privatizing here disallows the IRBuilder to
-    // draw a relation between %linear and %arg0. Hence skip.
-    // Except for `OmpPreDetermined` symbols, that cannot be exceptions since
+    // draw a relation between %linear and %arg0. Hence skip, except for
+    // `OmpPreDetermined` symbols, that cannot be exceptions since
     // their privatized symbols are heavily used in FIR.
     if (explicitSymbols.contains(sym)) {
       if (sym->test(Symbol::Flag::OmpLinear) &&
@@ -344,14 +339,14 @@ void DataSharingProcessor::collectSymbolsForPrivatization() {
     if (sym->test(Symbol::Flag::OmpExplicit))
       return false;
 
-    // Pre-determined: only if flag is set.
+    // Pre-determined: collect only if flag is set.
     if (sym->test(Symbol::Flag::OmpPreDetermined))
       return shouldCollectPreDeterminedSymbols;
 
-    // Implicit:
-    // - if has default clause
-    // - if not composite/combined
-    // - if it is a taskgen dir
+    // Implicit: collect if:
+    // - has default clause
+    // - not composite/combined
+    // - it is a taskgen directive
     //   (XXX this will cause problems with "parallel ... taskloop" directives)
     if (sym->test(Symbol::Flag::OmpImplicit)) {
       if (hasDefaultClause)
@@ -368,14 +363,12 @@ void DataSharingProcessor::collectSymbolsForPrivatization() {
     return true;
   };
 
-  // Collect symbols where 'flag' is set and that match 'type'.
+  // Collect symbols where `flag` is set and that match `type`.
   auto collect = [&](Symbol::Flag flag,
                      std::optional<Symbol::Flag> type = std::nullopt) {
-    // Collect symbols.
-    symbols.clear();
+    llvm::SetVector<const Symbol *> symbols;
     collectSymbols(flag, symbols);
 
-    // Add filtered ones.
     for (auto *sym : symbols) {
       if (type && !sym->test(*type))
         continue;
@@ -384,30 +377,25 @@ void DataSharingProcessor::collectSymbolsForPrivatization() {
     }
   };
 
-  // Explicitely add explicit symbols.
-  // This is needed because they might not be referenced in the construct,
-  // which would make them to be skipped.
+  // Insert explicit symbols.
   for (auto *sym : explicitSymbols)
     if (shouldCollectSymbol(sym))
       allPrivatizedSymbols.insert(sym);
 
-  // For now, keep original privatization order to avoid having to change
-  // too many tests:
-  // - explicit
-  // - implicit
+  // For now, collect symbols in the same order as before, to avoid having to
+  // change too many tests:
+  // - implicit: private, firstprivate
   // - pre-determined
-
-  // TODO Replace with collect(Symbol::Flag::OmpImplicit) and update tests.
+  // In the future, it should be possible to collect implicit symbols in a
+  // single pass.
   collect(Symbol::Flag::OmpPrivate, Symbol::Flag::OmpImplicit);
   collect(Symbol::Flag::OmpFirstPrivate, Symbol::Flag::OmpImplicit);
-
   collect(Symbol::Flag::OmpPreDetermined);
 
-  // Handle symbols that are shared in nested regions, but private in the
-  // enclosing context.
-
-  // Get nested shared symbols.
-  symbols.clear();
+  // Handle implicit symbols that are shared in nested regions, but private in
+  // the enclosing (current) context.
+  // XXX Pre-determined symbols should probably be considered too.
+  llvm::SetVector<const Symbol *> symbols;
   collectSymbolsInNestedRegions(eval, Symbol::Flag::OmpShared, symbols);
 
   for (auto *sym : symbols) {
@@ -415,7 +403,7 @@ void DataSharingProcessor::collectSymbolsForPrivatization() {
     if (ancestor && ancestor->test(Symbol::Flag::OmpImplicit) &&
         !ancestor->test(Symbol::Flag::OmpShared))
       // This may result in additional privatization for non-immediate children,
-      // but at least is correct.
+      // but it is no incorrect.
       allPrivatizedSymbols.insert(ancestor);
   }
 }
@@ -613,13 +601,8 @@ void DataSharingProcessor::collectSymbolsInNestedRegions(
   }
 }
 
-// Collect symbols to be default privatized in two steps.
-// In step 1, collect all symbols in `eval` that match `flag` into
-// `defaultSymbols`. In step 2, for nested constructs (if any), if and only if
-// the nested construct is an OpenMP construct, collect those nested
-// symbols skipping host associated symbols into `symbolsInNestedRegions`.
-// Later, in current context, all symbols in the set
-// `defaultSymbols` - `symbolsInNestedRegions` will be privatized.
+// Collect symbols to be privatized.
+// Only symbols owned by the OpenMP construct being processed are collected.
 void DataSharingProcessor::collectSymbols(
     semantics::Symbol::Flag flag,
     llvm::SetVector<const semantics::Symbol *> &symbols) {
@@ -631,9 +614,6 @@ void DataSharingProcessor::collectSymbols(
                              /*collectSymbols=*/true,
                              /*collectHostAssociatedSymbols=*/false);
 
-  llvm::SetVector<const semantics::Symbol *> symbolsInNestedRegions;
-  collectSymbolsInNestedRegions(eval, flag, symbolsInNestedRegions);
-
   // Filter-out symbols that must not be privatized.
   auto isPrivatizable = [](const semantics::Symbol &sym) -> bool {
     return (semantics::IsProcedurePointer(sym) ||
@@ -644,14 +624,11 @@ void DataSharingProcessor::collectSymbols(
            !semantics::IsStmtFunction(sym);
   };
 
+  // NOTE Checking only if the symbol owner matches the current scope is
+  //      not always correct. For instance, symbols referenced only inside
+  //      a block statement will fail this test.
   for (const auto *sym : allSymbols) {
     assert(curScope && "couldn't find current scope");
-    // || sym->owner() == *curScope is needed because:
-    // Some constructs in the same directive may be nested, e.g.:
-    // omp parallel
-    //   do i = 1, 10
-    // ...
-    // i is in a nested eval
     if (isPrivatizable(*sym) && sym->owner() == *curScope)
       symbols.insert(sym);
   }
