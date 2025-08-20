@@ -1,131 +1,73 @@
 #include "flang/Optimizer/Builder/FIRBuilder.h"
-#include "flang/Optimizer/Dialect/FIRDialect.h"
 #include "flang/Optimizer/HLFIR/HLFIROps.h"
 #include "flang/Optimizer/HLFIR/Passes.h"
 #include "flang/Runtime/entry-names.h"
+#include "llvm/Support/DebugLog.h"
 
 namespace hlfir {
 #define GEN_PASS_DEF_EXPRESSIONSIMPLIFICATION
 #include "flang/Optimizer/HLFIR/Passes.h.inc"
 } // namespace hlfir
 
-#define DEBUG_TYPE "expression-simplification"
+#define DEBUG_TYPE  "expression-simplification"
 
-/*
- * TODOs
- * - document simplifyCharCompare()
- * - reduce debug info and use LDBG() instead
- *   (llvm/Support/DebugLog.h)
- * - remove extra includes
- * - invert args nest and parentUses
- * - review style
- * - del delLastUser
- * - review TrimRemover name
- * - FIXME adapt logic for -O3
- * - TODO test case when str0 == str1
- * - test other comparisons: </>/<=/>=
- */
+#define INDENT(n)   std::string((n) * 2, ' ')
 
-#define NL "\n"
-static bool outEnabled = true;
-static bool delOutEnabled = false;
+static void removeOperands(mlir::Operation *op, int nestLevel);
 
-static llvm::raw_ostream &out()
-{
-    if (outEnabled)
-      return llvm::errs() << "LLL: simplifyCharCompare: ";
-    return llvm::nulls() << "";
-}
+static void removeOp(mlir::Operation *op, int parentUses, int nestLevel) {
+  int opUses = std::distance(op->getUses().begin(), op->getUses().end());
 
-static llvm::raw_ostream &delOut(int nest)
-{
-  std::string tabs;
-
-  while (nest--)
-    tabs += "  ";
-  return (delOutEnabled ? llvm::errs() : llvm::nulls()) << tabs;
-}
-
-static void delOpOperands(mlir::Operation *op, int nest);
-
-static void delOp(mlir::Operation *op, int nest, int parentUses = 0) {
-  int uses = std::distance(op->getUses().begin(), op->getUses().end());
-
-  if (uses <= parentUses) {
-    delOut(nest) << "delOp(): deleting " << *op << NL;
-    delOpOperands(op, nest);
+  if (opUses <= parentUses) {
+    LDBG() << INDENT(nestLevel) << "remove: " << *op;
+    removeOperands(op, nestLevel);
     op->dropAllReferences();
     op->dropAllUses();
     op->erase();
-  } else {
-    delOut(nest) << "delOp(): not deleting " << *op
-      << ". Uses: " << std::distance(op->getUses().begin(), op->getUses().end()) << NL;
   }
 }
 
-static void delOpOperands(mlir::Operation *op, int nest)
-{
+static void removeOp(mlir::Operation *op) {
+  removeOp(op, /*parentUses=*/0, /*nestLevel=*/0);
+  LDBG();
+}
+
+static void removeOperands(mlir::Operation *op, int nestLevel) {
   for (mlir::Value operand : op->getOperands()) {
-    delOut(nest) << "delOpOperands(): operand: " << operand << NL;
     if (!operand)
-      // already deleted
+      // Already removed.
       continue;
-    mlir::Operation *operandOp = operand.getDefiningOp();
-    if (operandOp) {
+    if (mlir::Operation *operandOp = operand.getDefiningOp()) {
       int uses = 0;
-      for (auto &use : operandOp->getUses())
-        if (use.getOwner() == op)
+      for (mlir::Operation *user : operandOp->getUsers())
+        if (user == op)
           ++uses;
-      delOp(operandOp, nest + 1, uses);
+      removeOp(operandOp, uses, nestLevel + 1);
     }
   }
 }
 
-template <typename Op>
-static void delOpAndOperands(Op op)
-{
-  mlir::Operation *o = op.getOperation();
-  if (!o)
-    return;
-  delOp(o, 0);
-  delOut(0) << NL;
-}
-
-template <typename UserOp, typename Op>
-static UserOp getFirstUser(Op o)
-{
-  mlir::Operation *op = o.getOperation();
-  if (!op)
-    return {};
-
+template <typename UserOp>
+static UserOp getFirstUser(mlir::Operation *op) {
   auto it = op->user_begin(), end = op->user_end(), prev = it;
   for (; it != end; prev = it++)
     ;
   if (prev != end)
-    if (auto userOp = mlir::dyn_cast<UserOp>(**prev))
+    if (auto userOp = mlir::dyn_cast<UserOp>(*prev))
       return userOp;
   return {};
 }
 
-template <typename UserOp, typename Op>
-static UserOp getLastUser(Op o)
-{
-  if (mlir::Operation *op = o.getOperation()) {
-    if (!op->getUses().empty()) {
-      if (auto userOp = mlir::dyn_cast<UserOp>(op->use_begin()->getOwner()))
-        return userOp;
-    }
-  }
+template <typename UserOp>
+static UserOp getLastUser(mlir::Operation *op) {
+  if (!op->getUsers().empty())
+    if (auto userOp = mlir::dyn_cast<UserOp>(*op->user_begin()))
+      return userOp;
   return {};
 }
 
-template <typename UserOp, typename Op1, typename Op2>
-static UserOp getPreviousUser(Op1 o, Op2 curUser)
-{
-  mlir::Operation *op = o.getOperation();
-  if (!op)
-    return {};
-
+template <typename UserOp>
+static UserOp getPreviousUser(mlir::Operation *op, mlir::Operation *curUser) {
   for (auto user = op->user_begin(), end = op->user_end(); user != end; ++user) {
     if (*user == curUser) {
       if (++user == end)
@@ -138,62 +80,39 @@ static UserOp getPreviousUser(Op1 o, Op2 curUser)
   return {};
 }
 
-template <typename UserOp, typename Op>
-static void delLastUser(Op o)
-{
-  if (mlir::Operation *op = o.getOperation()) {
-    if (!op->getUses().empty()) {
-      if (auto userOp = mlir::dyn_cast<UserOp>(op->use_begin()->getOwner())) {
-        delOpAndOperands(userOp);
-      }
-    }
+// Check if operation has the expected number of uses.
+static bool expectUses(mlir::Operation *op, int expUses) {
+  int uses = std::distance(op->use_begin(), op->use_end());
+  if (uses != expUses) {
+    LDBG() << "expectUses: expected " << expUses << ", got " << uses;
+    for (mlir::Operation *user : op->getUsers())
+      LDBG() << "\t" << *user;
   }
+  return uses == expUses;
 }
 
 template <typename Op>
 static Op expectOp(mlir::Value val) {
-  if (Op op = mlir::dyn_cast_or_null<Op>(val.getDefiningOp()))
+  if (Op op = mlir::dyn_cast<Op>(val.getDefiningOp())) {
+    LDBG() << op;
     return op;
-  return nullptr;
-}
-
-template <typename Op>
-static mlir::Value findDefSingle(fir::ConvertOp op) {
-  if (auto defOp = expectOp<Op>(op->getOperand(0))) {
-    return defOp.getResult();
   }
   return {};
-}
-
-template <typename... Ops>
-static mlir::Value findDef(fir::ConvertOp op) {
-  mlir::Value defOp;
-  // Loop over the operation types given to see if any match, exiting once
-  // a match is found. Cast to void is needed to avoid compiler complaining
-  // that the result of expression is unused
-  (void)((defOp = findDefSingle<Ops>(op), (defOp)) || ...);
-  return defOp;
 }
 
 static mlir::Value findBoxDef(mlir::Value val) {
   if (auto op = expectOp<fir::ConvertOp>(val)) {
     assert(op->getOperands().size() != 0);
-    return findDef<fir::EmboxOp, fir::ReboxOp>(op);
+    if (auto boxOp = expectOp<fir::EmboxOp>(op->getOperand(0)))
+      return boxOp.getResult();
   }
   return {};
 }
 
-template <typename Op>
-static Op expOp(mlir::Value val, const char *id)
-{
-  auto op = expectOp<Op>(val);
-  if (op)
-    out() << id << ": " << op << NL;
-  return op;
-}
-
 namespace {
 
+// This class analyzes a trimmed character and removes the call to trim() (and
+// its dependencies) if its result is not used elsewhere.
 class TrimRemover {
 public:
   TrimRemover(fir::FirOpBuilder &builder, mlir::Value charVal, mlir::Value charLenVal)
@@ -204,104 +123,77 @@ public:
   void removeTrim();
 
 private:
-  // input
+  // Class inputs.
   fir::FirOpBuilder &builder;
   mlir::Value charVal;
   mlir::Value charLenVal;
-
-  // state
-
-  // Needed for trim removal
-  fir::ConvertOp charCvtOp;     // May be replaced by charVal
-  fir::ConvertOp charLenCvtOp;  // May be replaced by charLenVal
-  hlfir::DeclareOp charDeclOp;  // Replaces trim result
-  fir::CallOp trimCallOp;
-
-  hlfir::EndAssociateOp endAssocOp;   // The other assocOp user
-  hlfir::DestroyOp destroyExprOp;     // The other asExprOp user
-  // allocaOp can only be removed after all of its users and associated
-  // storeOp are removed.
-  fir::AllocaOp allocaOp;
+  // Operations found while analyzing inputs, that are needed when removing
+  // the trim call.
+  hlfir::DeclareOp charDeclOp;        // Trim input character.
+  fir::CallOp trimCallOp;             // Trim call.
+  hlfir::EndAssociateOp endAssocOp;   // Trim result association.
+  hlfir::DestroyOp destroyExprOp;     // Trim result expression.
+  fir::AllocaOp allocaOp;             // Trim result alloca.
 };
 
-template <typename Op>
-static bool expectUses(Op &op, int expUses)
-{
-  mlir::Operation *o = op.getOperation();
-  if (!o)
-    return false;
-  int uses = std::distance(o->use_begin(), o->use_end());
-  if (uses != expUses) {
-    out() << "expectUses: expected " << expUses << ", got " << uses << NL;
-    for (auto user : o->getUsers())
-      out() << "\t" << *user << NL;
-  }
-  return uses == expUses;
-}
-
 bool TrimRemover::charWasTrimmed() {
-  out() << "arg: " << charVal << NL;
+  LDBG() << "\ncharWasTrimmed: " << charVal;
 
-  // Get CharacterCompareScalar args
-  charCvtOp = expOp<fir::ConvertOp>(charVal, "cvt");
-  charLenCvtOp = expOp<fir::ConvertOp>(charLenVal, "cvtLen");
-  if (!charCvtOp || !charLenCvtOp)
+  // Get the declare and expression operations associated to `charVal`, that
+  // correspond to the result of trim.
+  auto charCvtOp = expectOp<fir::ConvertOp>(charVal);
+  auto charLenCvtOp = expectOp<fir::ConvertOp>(charLenVal);
+  if (!charCvtOp || !charLenCvtOp || !expectUses(charCvtOp, 1) ||
+      !expectUses(charLenCvtOp, 1))
     return false;
-
-  // Get decl and expression associated to 'charVal'
-  auto assocOp = expOp<hlfir::AssociateOp>(charCvtOp.getOperand(), "assoc");
-  // end_associate uses it twice
-  if (!assocOp || !expectUses(assocOp, 3))
+  auto assocOp = expectOp<hlfir::AssociateOp>(charCvtOp.getOperand());
+  if (!assocOp || !expectUses(assocOp, 3))  // end_associate uses assocOp twice
     return false;
   endAssocOp = getLastUser<hlfir::EndAssociateOp>(assocOp);
   if (!endAssocOp)
     return false;
-  auto asExprOp = expOp<hlfir::AsExprOp>(assocOp.getOperand(0), "expr");
+  auto asExprOp = expectOp<hlfir::AsExprOp>(assocOp.getOperand(0));
   if (!asExprOp || !expectUses(asExprOp, 2))
     return false;
   destroyExprOp = getLastUser<hlfir::DestroyOp>(asExprOp);
   if (!destroyExprOp)
     return false;
-  auto declOp = expOp<hlfir::DeclareOp>(asExprOp.getOperand(0), "decl");
+  auto declOp = expectOp<hlfir::DeclareOp>(asExprOp.getOperand(0));
   if (!declOp || !expectUses(declOp, 1))
     return false;
 
-  // Get associated box and alloca
-  auto boxAddrOp = expOp<fir::BoxAddrOp>(declOp.getMemref(), "boxAddr");
+  // Get associated box and alloca.
+  auto boxAddrOp = expectOp<fir::BoxAddrOp>(declOp.getMemref());
   if (!boxAddrOp || !expectUses(boxAddrOp, 1))
     return false;
-  auto loadOp = expOp<fir::LoadOp>(boxAddrOp.getOperand(), "load");
+  auto loadOp = expectOp<fir::LoadOp>(boxAddrOp.getOperand());
   if (!loadOp || !getFirstUser<fir::BoxEleSizeOp>(loadOp) || !expectUses(loadOp, 2))
     return false;
-  allocaOp = expOp<fir::AllocaOp>(loadOp.getMemref(), "alloca");
-  if (!allocaOp ||
-      !getFirstUser<fir::StoreOp>(allocaOp) ||  // initialization
-                                                // load
-                                                // convert, used by trim
+  // The allocaOp is initialized by a store.
+  // Besides its use by the store and loadOp, it's also converted and used by
+  // the trim call.
+  allocaOp = expectOp<fir::AllocaOp>(loadOp.getMemref());
+  if (!allocaOp || !getFirstUser<fir::StoreOp>(allocaOp) ||
       !expectUses(allocaOp, 3))
     return false;
 
-  // Get previous user of allocaOp and its user (trim call)
-  if (auto userOp = getPreviousUser<fir::ConvertOp>(allocaOp, loadOp)) {
-    out() << "prevUser: " << userOp << NL;
-    // Check if the previous user is the only user one and a CallOp
-    if (userOp.getOperation() && userOp->hasOneUse())
+  // Find the trim call that uses the allocaOp.
+  if (auto userOp = getPreviousUser<fir::ConvertOp>(allocaOp, loadOp))
+    if (userOp->hasOneUse())
       trimCallOp = mlir::dyn_cast<fir::CallOp>(*userOp->user_begin());
-  }
-
   if (!trimCallOp)
     return false;
-  out() << "call: " << trimCallOp << NL;
+  LDBG() << "call: " << trimCallOp;
   llvm::StringRef calleeName = trimCallOp.getCalleeAttr().getLeafReference().getValue();
-  out() << "callee: " << calleeName << NL;
+  LDBG() << "callee: " << calleeName;
   if (calleeName != RTNAME_STRING(Trim))
     return false;
 
-  // Get source char
-  auto chrEmboxOp = expOp<fir::EmboxOp>(findBoxDef(trimCallOp.getOperand(1)), "chrEmbox");
+  // Get trim input character.
+  auto chrEmboxOp = expectOp<fir::EmboxOp>(findBoxDef(trimCallOp.getOperand(1)));
   if (!chrEmboxOp)
     return false;
-  charDeclOp = expOp<hlfir::DeclareOp>(chrEmboxOp.getMemref(), "charDecl");
+  charDeclOp = expectOp<hlfir::DeclareOp>(chrEmboxOp.getMemref());
   if (!charDeclOp)
     return false;
 
@@ -309,31 +201,35 @@ bool TrimRemover::charWasTrimmed() {
   return true;
 }
 
-void TrimRemover::removeTrim()
-{
-  // Replace trim output char with its input
+void TrimRemover::removeTrim() {
+  LDBG() << "\nremoveTrim:";
+
+  auto charCvtOp = expectOp<fir::ConvertOp>(charVal);
+  auto charLenCvtOp = expectOp<fir::ConvertOp>(charLenVal);
+  assert(charCvtOp && charLenCvtOp);
+
+  // Replace trim output char with its input.
   mlir::Location loc = charVal.getLoc();
   auto cvtOp = fir::ConvertOp::create(builder, loc, charCvtOp.getType(),
       charDeclOp.getOriginalBase());
   charCvtOp.replaceAllUsesWith(cvtOp.getResult());
 
-  // Replace trim output length with its input
-  mlir::Value strLen = charDeclOp.getTypeparams().back();
-  auto cvtLenOp = fir::ConvertOp::create(builder, loc, charLenCvtOp.getType(), strLen);
+  // Replace trim output length with its input.
+  mlir::Value chrLen = charDeclOp.getTypeparams().back();
+  auto cvtLenOp = fir::ConvertOp::create(builder, loc, charLenCvtOp.getType(), chrLen);
   charLenCvtOp.replaceAllUsesWith(cvtLenOp.getResult());
 
-  // delelte old converts
-  delOpAndOperands(charCvtOp);
-  delOpAndOperands(charLenCvtOp);
-  // delete trim call
-  delOpAndOperands(trimCallOp);
-
-  // delete associate (assocOp, endAssocOp)
-  delOpAndOperands(endAssocOp);
-  // delete expr (destroyOp, asExprOp, declOp)
-  delOpAndOperands(destroyExprOp);
-  // delete initialzation store and alloca
-  delLastUser<fir::StoreOp>(allocaOp);
+  // Remove trim call and old conversions.
+  removeOp(charCvtOp);
+  removeOp(charLenCvtOp);
+  removeOp(trimCallOp);
+  // Remove association and expression.
+  removeOp(endAssocOp);
+  removeOp(destroyExprOp);
+  // The only remaining use of allocaOp should be its initialization.
+  // Remove the store and alloca operations.
+  if (auto userOp = getLastUser<fir::StoreOp>(allocaOp))
+    removeOp(userOp);
 }
 
 } // namespace
@@ -349,6 +245,14 @@ public:
   void runOnOperation() override;
 
 private:
+  // Simplify character comparisons.
+  // Because character comparison appends spaces to the shorter character,
+  // calls to trim() that are used only in the comparison can be eliminated.
+  //
+  // Example:
+  // `trim(x) == trim(y)`
+  // can be simplified to
+  // `x == y`
   void simplifyCharCompare(fir::CallOp call, const fir::KindMapping &kindMap);
 };
 
@@ -359,15 +263,10 @@ void ExpressionSimplification::simplifyCharCompare(fir::CallOp call,
   TrimRemover lhsTrimRem(builder, args[0], args[2]);
   TrimRemover rhsTrimRem(builder, args[1], args[3]);
 
-  outEnabled = true;
-  if (lhsTrimRem.charWasTrimmed()) {
-    delOut(0) << "\nLLL: *** DEL trim0 ***\n";
+  if (lhsTrimRem.charWasTrimmed())
     lhsTrimRem.removeTrim();
-  }
-  if (rhsTrimRem.charWasTrimmed()) {
-    delOut(0) << "\nLLL: *** DEL trim1 ***\n";
+  if (rhsTrimRem.charWasTrimmed())
     rhsTrimRem.removeTrim();
-  }
 }
 
 void ExpressionSimplification::runOnOperation() {
