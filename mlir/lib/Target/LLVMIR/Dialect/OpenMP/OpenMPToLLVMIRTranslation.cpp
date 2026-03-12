@@ -3398,6 +3398,16 @@ convertOmpSimd(Operation &opInst, llvm::IRBuilderBase &builder,
   if (handleError(afterAllocas, opInst).failed())
     return failure();
 
+#if 0
+  for (auto [mlirVar, llvmVar, priv] : llvm::zip_equal(
+        privateVarsInfo.mlirVars, privateVarsInfo.llvmVars, privateVarsInfo.privatizers)) {
+    llvm::errs() << mlirVar << " -> " << *llvmVar << "\n";
+    llvm::errs() << "privatizer: " << priv << "\n";
+    llvm::errs() << "mlir2llvm: " << *moduleTranslation.lookupValue(mlirVar) << "\n";
+  }
+#endif
+
+
   // Initialize linear variables and linear step
   LinearClauseProcessor linearClauseProcessor;
 

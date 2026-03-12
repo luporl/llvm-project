@@ -287,8 +287,10 @@ void DataSharingProcessor::collectSymbolsForPrivatization() {
   // so, we won't need to explicitly handle block objects (or forget to do
   // so).
   for (auto *sym : explicitlyPrivatizedSymbols)
-    if (!isException(sym))
+    if (!isException(sym)) {
+      llvm::errs() << "explicit: " << *sym << "\n";
       allPrivatizedSymbols.insert(sym);
+    }
 }
 
 bool DataSharingProcessor::needBarrier() {
@@ -461,6 +463,112 @@ void DataSharingProcessor::collectSymbolsInNestedRegions(
   }
 }
 
+static bool needLinearPrivatization(
+    std::function<bool(const lower::pft::Evaluation &)> isOpenMPPrivatizingEvaluation,
+    const semantics::Symbol &symbol,
+    lower::pft::Evaluation &eval,
+    const semantics::SemanticsContext &semaCtx,
+    lower::AbstractConverter &converter)
+{
+  if (!symbol.test(semantics::Symbol::Flag::OmpLinear))
+    return false;
+
+  // LLDBG
+  auto firstLine = [](const char *s) {
+    if (!s)
+      return std::string("null");
+    std::string str(s);
+    return str.substr(0, str.find("\n"));
+  };
+  auto dumpScope = [&](const semantics::Scope &scope, const char *label) {
+    llvm::errs() << label << ": "
+      << firstLine(scope.sourceRange().begin()) << "\n"
+      << scope;
+  };
+  dumpScope(symbol.owner(), "scope");
+
+  // get enclosing privatizing eval
+  const lower::pft::Evaluation *parentEval = eval.parentConstruct;
+  const char *parentEvalSrc = getSource(semaCtx, eval).begin();
+  // llvm::errs() << "eval: " << firstLine(parentEvalSrc) << "\n";
+  while (parentEval) {
+    parentEvalSrc = getSource(semaCtx, *parentEval).begin();
+    // llvm::errs() << "peval: " << firstLine(parentEvalSrc) << "\n";
+    // parentEval->dump();
+    if (isOpenMPPrivatizingEvaluation(*parentEval))
+      break;
+    parentEval = parentEval->parentConstruct;
+  }
+  if (!parentEval) {
+    llvm::errs() << "parentEval not found\n";
+    return false;
+  }
+
+  // get enclosing privatizing scope
+  const semantics::Scope *parentScope = symbol.owner().IsTopLevel() ? nullptr :
+                                            &symbol.owner().parent();
+  while (parentScope) {
+    // llvm::errs() << "pscope: "
+    //  << firstLine(parentScope->sourceRange().begin()) << "\n";
+    if (parentScope->sourceRange().begin() == parentEvalSrc)
+      break;
+    parentScope = parentScope->IsTopLevel() ? nullptr : &parentScope->parent();
+  }
+  if (!parentScope) {
+    llvm::errs() << "parentScope not found\n";
+    return false;
+  }
+  dumpScope(*parentScope, "parentScope");
+
+  // find symbol in parentScope
+  // TODO check if this finds symbols in nested scopes as well
+  const semantics::Symbol *sym = parentScope->FindSymbol(symbol.name());
+  llvm::errs() << "parentScopeSym: ";
+  if (sym)
+    llvm::errs() << *sym;
+  else
+    llvm::errs() << "null";
+  llvm::errs() << "\n";
+  if (!sym) {
+    llvm::errs() << "parentScopeSymbol not found\n";
+    return false;
+  }
+
+  if (sym->test(semantics::Symbol::Flag::OmpShared))
+    return false;
+
+  // check if 'sym' is referenced in parentScope or nested scopes that exclude
+  // the original scope
+
+  auto collectSyms = [&](const std::string &name,
+      const lower::pft::Evaluation &eval,
+      llvm::SetVector<const Fortran::semantics::Symbol *> syms) {
+    auto addToList = [&](const Fortran::semantics::Symbol &sym) {
+      if (sym.name().ToString() == name)
+        syms.insert(&sym);
+      // TODO handle common blocks
+      // TODO test host associated symbols
+      // TODO handle blocks
+    };
+    Fortran::lower::pft::visitAllSymbols(eval, addToList);
+  };
+
+  llvm::SetVector<const Fortran::semantics::Symbol *> syms, parentSyms;
+  collectSyms(symbol.name().ToString(), eval, syms);
+  // FIXME extract parentEval variant and use it instead
+  //       (check getSource())
+  collectSyms(symbol.name().ToString(), *parentEval, parentSyms);
+
+  // parentSyms.set_subtract(syms);
+  llvm::errs() << "parentSyms:\n";
+  for (const auto *s : parentSyms)
+    llvm::errs() << "  " << *s << "\n";
+  llvm::errs() << "syms:\n";
+  for (const auto *s : syms)
+    llvm::errs() << "  " << *s << "\n";
+  return false;
+}
+
 // Collect symbols to be default privatized in two steps.
 // In step 1, collect all symbols in `eval` that match `flag` into
 // `defaultSymbols`. In step 2, for nested constructs (if any), if and only if
@@ -550,6 +658,10 @@ void DataSharingProcessor::collectSymbols(
     if (isPrivatizable(*sym) && !symbolsInNestedRegions.contains(sym) &&
         !explicitlyPrivatizedSymbols.contains(sym) &&
         shouldCollectSymbol(sym) && clauseScopes.contains(&sym->owner())) {
+      bool ret = needLinearPrivatization(
+            [this](const lower::pft::Evaluation &e) { return isOpenMPPrivatizingEvaluation(e); },
+            *sym, eval, semaCtx, converter);
+      llvm::errs() << "implicit (needLinearPriv=" << ret << "): " << *sym << "\n\n";
       allPrivatizedSymbols.insert(sym);
       symbols.insert(sym);
     }
