@@ -31,10 +31,7 @@
 #include "llvm/ADT/Sequence.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/Frontend/OpenMP/OMP.h"
-#include "llvm/Support/raw_ostream.h"
 #include <variant>
-
-#define LLDBG   0
 
 namespace Fortran {
 namespace lower {
@@ -100,15 +97,6 @@ void DataSharingProcessor::processStep1(
   collectImplicitSymbols();
   collectPreDeterminedSymbols();
   collectIndirectReferences();
-
-#if LLDBG
-  if (dir)
-    llvm::errs() << "dir: " << llvm::omp::getOpenMPDirectiveName(*dir) << "\n";
-  if (clauseOps)
-    for (auto [var, sym] : llvm::zip_equal(clauseOps->privateVars, clauseOps->privateSyms))
-      llvm::errs() << "var: " << var << "\n"
-        << "sym: " << sym << "\n";
-#endif
 
   privatize(clauseOps, dir);
 
@@ -333,17 +321,6 @@ void DataSharingProcessor::insertBarrier(
 }
 
 void DataSharingProcessor::insertLastPrivateCompare(mlir::Operation *op) {
-#if LLDBG
-  if (mlir::isa<mlir::omp::ParallelOp>(op))
-    llvm::errs() << ">> parallel\n";
-  if (mlir::isa<mlir::omp::SectionsOp>(op))
-    llvm::errs() << ">> section\n";
-  if (mlir::isa<mlir::omp::WsloopOp>(op))
-    llvm::errs() << ">> wsloop\n";
-  if (mlir::isa<mlir::omp::SimdOp>(op))
-    llvm::errs() << ">> simd\n";
-#endif
-
   mlir::omp::LoopNestOp loopOp;
   if (auto wrapper = mlir::dyn_cast<mlir::omp::LoopWrapperInterface>(op))
     loopOp = mlir::cast<mlir::omp::LoopNestOp>(wrapper.getWrappedLoop());
@@ -431,7 +408,6 @@ void DataSharingProcessor::insertLastPrivateCompare(mlir::Operation *op) {
   } else if (mlir::isa<mlir::omp::SectionsOp>(op)) {
     // Already handled by genOMP()
   } else {
-    op->dump();   // LLDBG
     TODO(converter.getCurrentLocation(),
          "lastprivate clause in constructs other than "
          "simd/worksharing-loop/taskloop");
@@ -635,19 +611,6 @@ void DataSharingProcessor::collectPreDeterminedSymbols() {
 }
 
 void DataSharingProcessor::collectIndirectReferences() {
-#if LLDBG
-  bool _dbg = true;
-#else
-  bool _dbg = false;
-#endif
-  auto dbg = [_dbg]() -> llvm::raw_ostream & {
-    if (_dbg)
-      return llvm::errs();
-    else
-      return llvm::nulls();
-  };
-
-  //return;
   if (!shouldCollectPreDeterminedSymbols)
     return;
 
@@ -685,38 +648,16 @@ void DataSharingProcessor::collectIndirectReferences() {
   //      directive for now.
   llvm::SetVector<const semantics::Symbol *> indirectReferences;
 
-#if LLDBG
-  // Dump first line of eval's source
-  auto evalDump = [&](const lower::pft::Evaluation &e, const char *msg) {
-    parser::CharBlock source = getSource(semaCtx, e);
-    assert(!source.empty());
-    std::string src = source.begin();
-    src = src.substr(0, src.find("\n"));
-    dbg() << msg << ": " << src << "\n";
-  };
-  evalDump(eval, "\nindref");
-  // Dump eval and nested eval
-  {
-    dbg() << "eval: "; eval.dump();
-    if (eval.hasNestedEvaluations()) {
-      dbg() << "nested: "; eval.getFirstNestedEvaluation().dump();
-    }
-      //evalDump(eval.getFirstNestedEvaluation(), "nested");
-  }
-#endif
-
   // for each symbol in current scope
   for (auto it = curScope->begin(), end = curScope->end();
       it != end; ++it) {
     const semantics::Symbol &sym = *it->second;
-    dbg() << "indref: sym: " << sym << "\n";
     // skip shared
     if (sym.test(semantics::Symbol::Flag::OmpShared))
       continue;
 
     // for each nested symbol
     for (const semantics::Symbol *nestedSym : symbolsInNestedRegions) {
-      dbg() << "indref: nestedSym: " << *nestedSym << "\n";
       // if it's not the same symbol of the current scope and it has the same
       // name, then it is and indirect reference.
       if (&sym != nestedSym && sym.name() == nestedSym->name())
@@ -726,11 +667,8 @@ void DataSharingProcessor::collectIndirectReferences() {
 
   // insert indirect references to allSymbols and remove them from nested
   // regions.
-  for (const semantics::Symbol *sym : indirectReferences) {
-    dbg() << "indirect: " << *sym << "\n";
-    // allSymbols.insert(sym);
+  for (const semantics::Symbol *sym : indirectReferences)
     symbolsInNestedRegions.remove(sym);
-  }
 
   collectPrivatizedSymbols(std::nullopt, indirectReferences, symbolsInNestedRegions);
 }
