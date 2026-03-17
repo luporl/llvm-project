@@ -112,12 +112,13 @@ private:
 
   bool needBarrier();
   void collectPrivatizedSymbols(
-    std::optional<semantics::Symbol::Flag> flag,
-    const llvm::SetVector<const semantics::Symbol *> &allSymbols,
-    const llvm::SetVector<const semantics::Symbol *> &symbolsInNestedRegions,
-    llvm::SetVector<const semantics::Symbol *> *symbols = nullptr);
-  void collectSymbols(semantics::Symbol::Flag flag,
+      std::optional<semantics::Symbol::Flag> flag,
+      const llvm::SetVector<const semantics::Symbol *> &allSymbols,
+      const llvm::SetVector<const semantics::Symbol *> &symbolsInNestedRegions,
       llvm::SetVector<const semantics::Symbol *> *symbols = nullptr);
+  void
+  collectSymbols(semantics::Symbol::Flag flag,
+                 llvm::SetVector<const semantics::Symbol *> *symbols = nullptr);
   void collectSymbolsInNestedRegions(
       lower::pft::Evaluation &eval, semantics::Symbol::Flag flag,
       llvm::SetVector<const semantics::Symbol *> &symbolsInNestedRegions);

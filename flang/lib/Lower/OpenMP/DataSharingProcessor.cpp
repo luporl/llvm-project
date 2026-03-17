@@ -462,10 +462,10 @@ void DataSharingProcessor::collectSymbolsInNestedRegions(
   }
 }
 
-static const semantics::Scope *collectScopes(
-    semantics::SemanticsContext &semaCtx,
-    lower::pft::Evaluation &eval,
-    llvm::SetVector<const semantics::Scope *> &clauseScopes) {
+static const semantics::Scope *
+collectScopes(semantics::SemanticsContext &semaCtx,
+              lower::pft::Evaluation &eval,
+              llvm::SetVector<const semantics::Scope *> &clauseScopes) {
   // Collect all scopes associated with 'eval'.
   std::function<void(const semantics::Scope *)> collect =
       [&](const semantics::Scope *scope) {
@@ -566,7 +566,8 @@ void DataSharingProcessor::collectPrivatizedSymbols(
 // symbols skipping host associated symbols into `symbolsInNestedRegions`.
 // Later, in current context, all symbols in the set
 // `defaultSymbols` - `symbolsInNestedRegions` will be privatized.
-void DataSharingProcessor::collectSymbols(semantics::Symbol::Flag flag,
+void DataSharingProcessor::collectSymbols(
+    semantics::Symbol::Flag flag,
     llvm::SetVector<const semantics::Symbol *> *symbols) {
   // Collect all symbols referenced in the evaluation being processed,
   // that matches 'flag'.
@@ -649,8 +650,7 @@ void DataSharingProcessor::collectIndirectReferences() {
   llvm::SetVector<const semantics::Symbol *> indirectReferences;
 
   // for each symbol in current scope
-  for (auto it = curScope->begin(), end = curScope->end();
-      it != end; ++it) {
+  for (auto it = curScope->begin(), end = curScope->end(); it != end; ++it) {
     const semantics::Symbol &sym = *it->second;
     // skip shared
     if (sym.test(semantics::Symbol::Flag::OmpShared))
@@ -670,7 +670,8 @@ void DataSharingProcessor::collectIndirectReferences() {
   for (const semantics::Symbol *sym : indirectReferences)
     symbolsInNestedRegions.remove(sym);
 
-  collectPrivatizedSymbols(std::nullopt, indirectReferences, symbolsInNestedRegions);
+  collectPrivatizedSymbols(std::nullopt, indirectReferences,
+                           symbolsInNestedRegions);
 }
 
 void DataSharingProcessor::privatize(mlir::omp::PrivateClauseOps *clauseOps,
