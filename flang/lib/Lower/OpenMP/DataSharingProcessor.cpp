@@ -462,11 +462,11 @@ void DataSharingProcessor::collectSymbolsInNestedRegions(
   }
 }
 
+// Collect all scopes associated with `eval` and return the current scope.
 static const semantics::Scope *
 collectScopes(semantics::SemanticsContext &semaCtx,
               lower::pft::Evaluation &eval,
               llvm::SetVector<const semantics::Scope *> &clauseScopes) {
-  // Collect all scopes associated with 'eval'.
   std::function<void(const semantics::Scope *)> collect =
       [&](const semantics::Scope *scope) {
         clauseScopes.insert(scope);
@@ -496,8 +496,8 @@ void DataSharingProcessor::collectPrivatizedSymbols(
     const llvm::SetVector<const semantics::Symbol *> &symbolsInNestedRegions,
     llvm::SetVector<const semantics::Symbol *> *symbols) {
   // Filter-out symbols that must not be privatized.
-  bool collectImplicit;
-  bool collectPreDetermined;
+  bool collectImplicit = false;
+  bool collectPreDetermined = false;
   bool collectIndirectRefs = !flag.has_value();
   if (!collectIndirectRefs) {
     collectImplicit = *flag == semantics::Symbol::Flag::OmpImplicit;
@@ -608,17 +608,20 @@ void DataSharingProcessor::collectPreDeterminedSymbols() {
     collectSymbols(semantics::Symbol::Flag::OmpPreDetermined);
 }
 
+// Collect symbols that may be referenced indirectly by lastprivate or linear
+// DSAs in nested constructs. Their privatization must not be skipped in the
+// enclosing context, to avoid updating the wrong symbol.
 void DataSharingProcessor::collectIndirectReferences() {
+  // For compound constructs, collect the symbols only for the last leaf.
   if (!shouldCollectPreDeterminedSymbols)
     return;
 
-  // collect scopes
   llvm::SetVector<const semantics::Scope *> clauseScopes;
   const semantics::Scope *curScope = collectScopes(semaCtx, eval, clauseScopes);
   if (!curScope)
     return;
 
-  // collect symbols
+  // Collect all linear and lastprivate symbols.
   llvm::SetVector<const semantics::Symbol *> allSymbols;
   llvm::SetVector<const semantics::Symbol *> symbolsInNestedRegions;
 
@@ -635,35 +638,35 @@ void DataSharingProcessor::collectIndirectReferences() {
     if (visitor.isSymbolDefineBy(symbol, eval))
       symbolsInNestedRegions.remove(symbol);
 
-  // Find indirect references
-  //
-  // A symbol in the current scope may be indirectly referenced by a DSA
-  // clause or a symbol with predetermined or implicitly determined DSA.
-  // Only linear and lastprivate DSAs affect symbols in the enclosing scope.
-  //
-  // TODO no need to privatize if symbol is privatized in all nested scopes
-  //      before use. Maybe handle only the simple case of a single nested
-  //      directive for now.
-  llvm::SetVector<const semantics::Symbol *> indirectReferences;
+  auto isPrivate = [](const semantics::Symbol &sym) {
+    using Symbol = semantics::Symbol;
+    Symbol::Flags privateFlags{
+        Symbol::Flag::OmpPrivate, Symbol::Flag::OmpFirstPrivate,
+        Symbol::Flag::OmpLastPrivate, Symbol::Flag::OmpLinear};
+    return (sym.flags() & privateFlags).any();
+  };
 
-  // for each symbol in current scope
+  // Find indirect references.
+  //
+  // A symbol in the current scope may be indirectly referenced by a DSA in
+  // nested constructs.
+  // To simplify the implementation, any linear/lastprivate symbol in a nested
+  // region is considered as an indirect reference. The produced output is
+  // correct, although it may contain privatizations that could be eliminated.
+  llvm::SetVector<const semantics::Symbol *> indirectReferences;
   for (auto it = curScope->begin(), end = curScope->end(); it != end; ++it) {
     const semantics::Symbol &sym = *it->second;
-    // skip shared
-    if (sym.test(semantics::Symbol::Flag::OmpShared))
+    if (!isPrivate(sym))
       continue;
 
-    // for each nested symbol
     for (const semantics::Symbol *nestedSym : symbolsInNestedRegions) {
-      // if it's not the same symbol of the current scope and it has the same
-      // name, then it is and indirect reference.
       if (&sym != nestedSym && sym.name() == nestedSym->name())
         indirectReferences.insert(&sym);
     }
   }
 
-  // insert indirect references to allSymbols and remove them from nested
-  // regions.
+  // Remove indirectly referenced symbols from nested regions, to force them
+  // to be privatized.
   for (const semantics::Symbol *sym : indirectReferences)
     symbolsInNestedRegions.remove(sym);
 
