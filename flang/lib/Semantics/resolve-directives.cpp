@@ -35,6 +35,24 @@
 
 namespace Fortran::semantics {
 
+// LLDBG {
+static const int LLDBG = 0;
+
+static llvm::raw_ostream &lldbg() {
+  if (LLDBG)
+    return llvm::errs();
+  return llvm::nulls();
+}
+
+static void dumpSymbol(const semantics::Symbol &sym) {
+  if (const auto *common = sym.detailsIf<semantics::CommonBlockDetails>()) {
+    for (const auto &obj : common->objects())
+      lldbg() << "  C " << *obj << "\n";
+  } else
+    lldbg() << "    " << sym << "\n";
+}
+// } LLDBG
+
 template <typename T>
 static Scope *GetScope(SemanticsContext &context, const T &x) {
   if (auto source{GetLastSource(x)}) {
@@ -2979,6 +2997,18 @@ void OmpAttributeVisitor::PropagateOmpFlagToEquivalenceSet(
 
 void OmpAttributeVisitor::ResolveOmpCommonBlock(
     const parser::Name &name, Symbol::Flag ompFlag) {
+  (void)dumpSymbol;
+  bool cloneCommonBlock{dataSharingAttributeFlags.test(ompFlag)};
+
+  if (name.symbol) {
+    if (auto *details{name.symbol->detailsIf<CommonBlockDetails>()}) {
+      if (!details->objects().empty()) {
+        // Common block already resolved
+        return;
+      }
+    }
+  }
+
   if (auto *symbol{ResolveOmpCommonBlockName(&name)}) {
     if (!dataCopyingAttributeFlags.test(ompFlag)) {
       CheckMultipleAppearances(name, *symbol, Symbol::Flag::OmpCommonBlock);
@@ -2987,6 +3017,7 @@ void OmpAttributeVisitor::ResolveOmpCommonBlock(
     // same meaning as if every explicit member of the common block
     // appeared in the list
     auto &details{symbol->get<CommonBlockDetails>()};
+    CommonBlockDetails cloneDetails{symbol->name()};
     for (auto [index, object] : llvm::enumerate(details.objects())) {
       if (auto *resolvedObject{ResolveOmp(*object, ompFlag, currScope())}) {
         if (dataCopyingAttributeFlags.test(ompFlag)) {
@@ -2994,13 +3025,24 @@ void OmpAttributeVisitor::ResolveOmpCommonBlock(
         } else {
           AddToContextObjectWithExplicitDSA(*resolvedObject, ompFlag);
         }
-        details.replace_object(*resolvedObject, index);
+        if (cloneCommonBlock) {
+          cloneDetails.add_object(*resolvedObject);
+        } else {
+          details.replace_object(*resolvedObject, index);
+        }
 
         // Propagate the flag to symbols in the equivalence set
         if (ompFlag == Symbol::Flag::OmpThreadprivate) {
           PropagateOmpFlagToEquivalenceSet(*resolvedObject, ompFlag);
         }
       }
+    }
+    if (cloneCommonBlock) {
+      name.symbol = &currScope().MakeSymbol(symbol->name(), symbol->attrs(), std::move(cloneDetails));
+      lldbg() << "ResolveOmpCommonBlock: orig:  " << *symbol << "\n";
+      dumpSymbol(*symbol);
+      lldbg() << "ResolveOmpCommonBlock: clone: " << *name.symbol << "\n";
+      dumpSymbol(*name.symbol);
     }
   } else {
     context_.Say(name.source, // 2.15.3

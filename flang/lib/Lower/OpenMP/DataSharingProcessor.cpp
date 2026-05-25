@@ -37,6 +37,25 @@
 namespace Fortran {
 namespace lower {
 namespace omp {
+
+// LLDBG {
+static const int LLDBG = 0;
+
+static llvm::raw_ostream &lldbg() {
+  if (LLDBG)
+    return llvm::errs();
+  return llvm::nulls();
+}
+
+static void dumpSymbol(const semantics::Symbol &sym) {
+  if (const auto *common = sym.detailsIf<semantics::CommonBlockDetails>()) {
+    for (const auto &obj : common->objects())
+      lldbg() << "  C " << *obj << "\n";
+  } else
+    lldbg() << "    " << sym << "\n";
+}
+// } LLDBG
+
 bool DataSharingProcessor::OMPConstructSymbolVisitor::isSymbolDefineBy(
     const semantics::Symbol *symbol, lower::pft::Evaluation &eval) const {
   return eval.visit(common::visitors{
@@ -227,8 +246,11 @@ void DataSharingProcessor::copyLastPrivateSymbol(
 void DataSharingProcessor::collectOmpObjectListSymbol(
     const omp::ObjectList &objects,
     llvm::SetVector<const semantics::Symbol *> &symbolSet) {
-  for (const omp::Object &object : objects)
+  for (const omp::Object &object : objects) {
+    lldbg() << "collectOmpObjectListSymbol: sym:\n";
+    dumpSymbol(*object.sym());
     symbolSet.insert(object.sym());
+  }
 }
 
 void DataSharingProcessor::collectSymbolsForPrivatization() {
