@@ -1538,7 +1538,7 @@ void OmpStructureChecker::CheckThreadprivateOrDeclareTargetVar(
     return;
   }
 
-  if (auto *cb{name.symbol->detailsIf<CommonBlockDetails>()}) {
+  if (auto *cb{name.symbol->GetUltimate().detailsIf<CommonBlockDetails>()}) {
     llvm::omp::Directive directive{GetContext().directive};
     for (const auto &obj : cb->objects()) {
       if (FindEquivalenceSet(*obj)) {
@@ -3024,7 +3024,7 @@ void OmpStructureChecker::Leave(const parser::OpenMPFlushConstruct &x) {
 
   auto isVariableListItemOrCommonBlock{[](const Symbol &sym) {
     return IsVariableListItem(sym) ||
-        sym.detailsIf<semantics::CommonBlockDetails>();
+        sym.GetUltimate().detailsIf<semantics::CommonBlockDetails>();
   }};
 
   if (flushList) {
@@ -3614,7 +3614,7 @@ void OmpStructureChecker::Leave(const parser::OmpClauseList &x) {
                   [&](const parser::Name &name) {
                     if (name.symbol) {
                       for (const auto &mem :
-                          name.symbol->get<CommonBlockDetails>().objects()) {
+                          name.symbol->GetUltimate().get<CommonBlockDetails>().objects()) {
                         testThreadprivateVarErr(mem->GetUltimate(), name, type);
                         break;
                       }
@@ -5486,7 +5486,7 @@ void OmpStructureChecker::GetSymbolsInObjectList(
     if (const auto *name{parser::Unwrap<parser::Name>(ompObject)}) {
       if (const auto *symbol{name->symbol}) {
         if (const auto *commonBlockDetails{
-                symbol->detailsIf<CommonBlockDetails>()}) {
+                symbol->GetUltimate().detailsIf<CommonBlockDetails>()}) {
           for (const auto &object : commonBlockDetails->objects()) {
             symbols.emplace(&object->GetUltimate(), name->source);
           }

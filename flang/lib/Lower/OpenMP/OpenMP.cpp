@@ -326,7 +326,7 @@ static void bindEntryBlockArgs(lower::AbstractConverter &converter,
     llvm::SmallVector<const semantics::Symbol *> processedSyms;
     for (auto *sym : syms) {
       if (const auto *commonDet =
-              sym->detailsIf<semantics::CommonBlockDetails>()) {
+              sym->GetUltimate().detailsIf<semantics::CommonBlockDetails>()) {
         llvm::transform(commonDet->objects(), std::back_inserter(processedSyms),
                         [&](const auto &mem) { return &*mem; });
       } else {

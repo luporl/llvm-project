@@ -2977,8 +2977,26 @@ void OmpAttributeVisitor::PropagateOmpFlagToEquivalenceSet(
   }
 }
 
+#if 0
+    llvm::errs() << "LL: sym: " << *name.symbol << "\n";
+    if (auto *details{name.symbol->detailsIf<CommonBlockDetails>()}) {
+      if (details->objects().empty())
+      for (const auto &obj : details->objects())
+        llvm::errs() << "LL: sym: C: " << *obj << "\n";
+    }
+#endif
+
 void OmpAttributeVisitor::ResolveOmpCommonBlock(
     const parser::Name &name, Symbol::Flag ompFlag) {
+  if (name.symbol) {
+    if (auto *details{name.symbol->detailsIf<CommonBlockDetails>()}) {
+      if (!details->objects().empty()) {
+        // Common block already resolved
+        return;
+      }
+    }
+  }
+
   if (auto *symbol{ResolveOmpCommonBlockName(&name)}) {
     if (!dataCopyingAttributeFlags.test(ompFlag)) {
       CheckMultipleAppearances(name, *symbol, Symbol::Flag::OmpCommonBlock);
@@ -2994,7 +3012,6 @@ void OmpAttributeVisitor::ResolveOmpCommonBlock(
         } else {
           AddToContextObjectWithExplicitDSA(*resolvedObject, ompFlag);
         }
-        details.replace_object(*resolvedObject, index);
 
         // Propagate the flag to symbols in the equivalence set
         if (ompFlag == Symbol::Flag::OmpThreadprivate) {
@@ -3002,6 +3019,8 @@ void OmpAttributeVisitor::ResolveOmpCommonBlock(
         }
       }
     }
+    // XXX can ompFlag overwrite another if new symbol is not created?
+    name.symbol = ResolveOmp(*symbol, ompFlag, currScope());
   } else {
     context_.Say(name.source, // 2.15.3
         "COMMON block must be declared in the same scoping unit in which the OpenMP directive or clause appears"_err_en_US);

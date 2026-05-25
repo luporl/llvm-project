@@ -37,6 +37,25 @@
 namespace Fortran {
 namespace lower {
 namespace omp {
+
+// LLDBG {
+static const int LLDBG = 1;
+
+static llvm::raw_ostream &lldbg() {
+  if (LLDBG)
+    return llvm::errs();
+  return llvm::nulls();
+}
+
+static void dumpSymbol(const semantics::Symbol &sym) {
+  if (const auto *common = sym.detailsIf<semantics::CommonBlockDetails>()) {
+    for (const auto &obj : common->objects())
+      lldbg() << "  C " << *obj << "\n";
+  } else
+    lldbg() << "    " << sym << "\n";
+}
+// } LLDBG
+
 bool DataSharingProcessor::OMPConstructSymbolVisitor::isSymbolDefineBy(
     const semantics::Symbol *symbol, lower::pft::Evaluation &eval) const {
   return eval.visit(common::visitors{
@@ -227,8 +246,10 @@ void DataSharingProcessor::copyLastPrivateSymbol(
 void DataSharingProcessor::collectOmpObjectListSymbol(
     const omp::ObjectList &objects,
     llvm::SetVector<const semantics::Symbol *> &symbolSet) {
-  for (const omp::Object &object : objects)
+  for (const omp::Object &object : objects) {
+    //dumpSymbol(*object.sym());
     symbolSet.insert(object.sym());
+  }
 }
 
 void DataSharingProcessor::collectSymbolsForPrivatization() {
@@ -328,16 +349,9 @@ void DataSharingProcessor::insertLastPrivateCompare(mlir::Operation *op) {
 
   mlir::OpBuilder::InsertionGuard guard(firOpBuilder);
   bool hasLastPrivate = [&]() {
-    for (const semantics::Symbol *sym : allPrivatizedSymbols) {
-      if (const auto *commonDet =
-              sym->detailsIf<semantics::CommonBlockDetails>()) {
-        for (const auto &mem : commonDet->objects())
-          if (mem->test(semantics::Symbol::Flag::OmpLastPrivate))
-            return true;
-      } else if (sym->test(semantics::Symbol::Flag::OmpLastPrivate))
+    for (const semantics::Symbol *sym : allPrivatizedSymbols)
+      if (sym->test(semantics::Symbol::Flag::OmpLastPrivate))
         return true;
-    }
-
     return false;
   }();
 
@@ -670,9 +684,16 @@ void DataSharingProcessor::privatize(mlir::omp::PrivateClauseOps *clauseOps,
                                      std::optional<llvm::omp::Directive> dir) {
   for (const semantics::Symbol *sym : allPrivatizedSymbols) {
     if (const auto *commonDet =
-            sym->detailsIf<semantics::CommonBlockDetails>()) {
-      for (const auto &mem : commonDet->objects())
-        privatizeSymbol(&*mem, clauseOps, dir);
+            sym->GetUltimate().detailsIf<semantics::CommonBlockDetails>()) {
+      for (const auto &obj : commonDet->objects()) {
+        // Use the symbol in the same scope, if it exists
+        const semantics::Symbol *objSym = sym->owner().FindSymbol(obj->name());
+        if (!objSym)
+          objSym = &*obj;
+        llvm::errs() << sym->owner() << "\n";
+        dumpSymbol(*objSym);
+        privatizeSymbol(objSym, clauseOps, dir);
+      }
     } else
       privatizeSymbol(sym, clauseOps, dir);
   }
@@ -682,9 +703,13 @@ void DataSharingProcessor::copyLastPrivatize(mlir::Operation *op) {
   insertLastPrivateCompare(op);
   for (const semantics::Symbol *sym : allPrivatizedSymbols)
     if (const auto *commonDet =
-            sym->detailsIf<semantics::CommonBlockDetails>()) {
-      for (const auto &mem : commonDet->objects()) {
-        copyLastPrivateSymbol(&*mem, &lastPrivIP);
+            sym->GetUltimate().detailsIf<semantics::CommonBlockDetails>()) {
+      for (const auto &obj : commonDet->objects()) {
+        // Use the symbol in the same scope, if it exists
+        const semantics::Symbol *objSym = sym->owner().FindSymbol(obj->name());
+        if (!objSym)
+          objSym = &*obj;
+        copyLastPrivateSymbol(objSym, &lastPrivIP);
       }
     } else {
       copyLastPrivateSymbol(sym, &lastPrivIP);
