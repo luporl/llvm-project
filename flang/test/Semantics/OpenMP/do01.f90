@@ -22,6 +22,7 @@ subroutine f01
   integer :: i
   !ERROR: Loop iteration variable with a predetermined data sharing attribute cannot appear in a FIRSTPRIVATE clause
   !ERROR: 'i' appears in more than one data-sharing clause on the same OpenMP directive
+  !ERROR: 'i' appears in more than one data-sharing clause on the same OpenMP directive
   !ERROR: Loop iteration variable with a predetermined data sharing attribute cannot appear in a LINEAR clause
   !$omp do firstprivate(i) lastprivate(i) linear(i)
   block

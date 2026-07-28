@@ -32,7 +32,18 @@
 #include <list>
 #include <map>
 
+#define ORIG  1
+#define DEBUG 0
+
 namespace Fortran::semantics {
+
+static llvm::raw_ostream &lldbg() {
+  const int dbg = DEBUG;
+  if (dbg) {
+    return llvm::errs();
+  }
+  return llvm::nulls();
+}
 
 template <typename T>
 static Scope *GetScope(SemanticsContext &context, const T &x) {
@@ -2165,7 +2176,8 @@ void OmpAttributeVisitor::PrivatizeAssociatedLoopIndex(
 
   int64_t level{*depth.value};
   Symbol::Flag ivDSA;
-  if (!llvm::omp::allSimdSet.test(GetContext().directive)) {
+  if (!llvm::omp::allSimdSet.test(GetContext().directive) ||
+      llvm::omp::allDoSet.test(GetContext().directive)) {
     ivDSA = Symbol::Flag::OmpPrivate;
   } else if (level == 1 && version < 60) {
     ivDSA = Symbol::Flag::OmpLinear;
@@ -2178,7 +2190,9 @@ void OmpAttributeVisitor::PrivatizeAssociatedLoopIndex(
   if (auto doLoops{omp::CollectAffectedDoLoops(x, version, &context_)}) {
     for (const parser::DoConstruct *loop : *doLoops) {
       const parser::Name *iv{GetLoopIndex(*loop)};
-      if (!iv || (iv->symbol && IsLocalInsideScope(*iv->symbol, scope))) {
+      if (!iv || (iv->symbol && IsLocalInsideScope(*iv->symbol, scope)) ||
+          // Don't overwrite explicit DSAs
+          iv->symbol->test(Symbol::Flag::OmpExplicit)) {
         continue;
       }
       if (auto *symbol{ResolveOmp(*iv, ivDSA, scope)}) {
@@ -2979,7 +2993,45 @@ void OmpAttributeVisitor::ResolveOmpDesignator(
     return;
   }
 
+  // Get previous flags/DSAs
+  Symbol::Flags prevFlags;
+  if (name->symbol) {
+    auto prevSym = currScope().find(name->source);
+    if (prevSym != currScope().end()) {
+      prevFlags = prevSym->second->flags();
+    }
+  }
+  lldbg() << "ResolveOmpDesignator.currScope().prevFlags: "
+      << prevFlags << "\n";
+  Symbol::Flags prevDSAs [[maybe_unused]]{prevFlags & dataSharingAttributeFlags};
+
   if (auto *symbol{ResolveOmp(*name, ompFlag, currScope())}) {
+    // Override PreDetermined DSA
+    if (symbol->test(Symbol::Flag::OmpPreDetermined) && prevDSAs.count() == 1) {
+      // Leave OmpPreDetermined flag set because some loop checks rely on it
+      symbol->flags() &= ~prevDSAs;
+      symbol->flags() |= {ompFlag};
+      lldbg() << "ResolveOmpDesignator.symbol NEW: " << *symbol << "\n";
+    }
+#if !ORIG
+    // Override PreDetermined DSA, replace linear/lastprivate with private.
+    Symbol::Flag symFlag{ompFlag};
+    if ((symbol->test(Symbol::Flag::OmpLinear) ||
+         symbol->test(Symbol::Flag::OmpLastPrivate)) &&
+        llvm::omp::allSimdSet.test(directive) &&
+        llvm::omp::allDoSet.test(directive) &&
+        // check if previous DSAs were valid before
+        // NOTE loop IVs can't be firstprivate
+        prevDSAs.count() == 1) {
+      // FIXME actually, we should only do this for loop iteration variables
+      symFlag = Symbol::Flag::OmpPrivate;
+      symbol->set(Symbol::Flag::OmpLinear, /*value=*/false);
+      symbol->set(Symbol::Flag::OmpLastPrivate, /*value=*/false);
+      symbol->set(Symbol::Flag::OmpPreDetermined, /*value=*/false);
+      symbol->set(symFlag);
+    }
+#endif
+
     auto checkExclusivelists{//
         [&](const Symbol *symbol1, Symbol::Flag firstOmpFlag,
             const Symbol *symbol2, Symbol::Flag secondOmpFlag) {
