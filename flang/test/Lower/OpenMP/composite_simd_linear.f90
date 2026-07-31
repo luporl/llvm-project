@@ -51,14 +51,13 @@ subroutine distribute_parallel_do
 !CHECK: omp.distribute {
 !DEFAULT: omp.wsloop linear(%[[I]]#0 : !fir.ref<i32> = %[[CONST]] : i32) {
 !OPENMP52: omp.wsloop linear(val(%[[I]]#0 : !fir.ref<i32> = %[[CONST]] : i32)) {
-!DEFAULT: omp.simd linear(%[[I]]#0 : !fir.ref<i32> = %[[IV_STEP]] : i32) {
-!OPENMP52: omp.simd linear(val(%[[I]]#0 : !fir.ref<i32> = %[[IV_STEP]] : i32)) {
+!CHECK: omp.simd private({{.*}} %[[I]]#0 -> %{{.*}}) {
     !$omp teams
     !$omp distribute parallel do simd linear(i:1)
     do i = 1, N
     end do
     !$omp end distribute parallel do simd
-!CHECK: } {linear_var_types = [i32], omp.composite}
+!CHECK: } {omp.composite}
 !CHECK: } {linear_var_types = [i32], omp.composite}
     !$omp end teams
 end subroutine distribute_parallel_do

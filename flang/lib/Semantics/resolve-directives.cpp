@@ -2187,18 +2187,85 @@ void OmpAttributeVisitor::PrivatizeAssociatedLoopIndex(
 
   Scope &scope{currScope()};
 
+  // Extract linear/lastprivate clauses here
+  std::set<const Symbol *> linearObjs;
+  std::set<const Symbol *> lastprivateObjs;
+  std::set<const Symbol *> allObjs;
+  bool explicitDSA{false};
+  auto getObjNames = [&](const parser::OmpObjectList &objs,
+                         std::set<const Symbol *> &syms) {
+      for (const parser::OmpObject &obj : objs.v) {
+        const parser::Name *objName{};
+        common::visit(
+          common::visitors{
+              [&](const parser::Designator &designator) {
+                objName = parser::GetDesignatorNameIfDataRef(designator);
+              },
+              [&](const parser::Name &name) {
+                objName = &name;
+              },
+              [&](const auto &other) {},
+          },
+          obj.u);
+        if (objName && objName->symbol) {
+          syms.insert(&objName->symbol->GetUltimate());
+          allObjs.insert(&objName->symbol->GetUltimate());
+        }
+      }
+  };
+  for (const parser::OmpClause &clause : x.BeginDir().Clauses().v) {
+    if (auto *linear{std::get_if<parser::OmpClause::Linear>(&clause.u)}) {
+      getObjNames(std::get<parser::OmpObjectList>(linear->v.t), linearObjs);
+    } else if (auto *lastprivate{std::get_if<parser::OmpClause::Lastprivate>(&clause.u)}) {
+      getObjNames(std::get<parser::OmpObjectList>(lastprivate->v.t), lastprivateObjs);
+    }
+  }
+  for (const auto *obj : linearObjs)
+    lldbg() << "LLL: linear: " << *obj << "\n";
+  for (const auto *obj : lastprivateObjs)
+    lldbg() << "LLL: lastprivate: " << *obj << "\n";
+
   if (auto doLoops{omp::CollectAffectedDoLoops(x, version, &context_)}) {
     for (const parser::DoConstruct *loop : *doLoops) {
       const parser::Name *iv{GetLoopIndex(*loop)};
-      if (!iv || (iv->symbol && IsLocalInsideScope(*iv->symbol, scope)) ||
+      if (!iv || (iv->symbol && IsLocalInsideScope(*iv->symbol, scope)) /*||
           // Don't overwrite explicit DSAs
-          iv->symbol->test(Symbol::Flag::OmpExplicit)) {
+          iv->symbol->test(Symbol::Flag::OmpExplicit)*/) {
         continue;
       }
+
+      // override explicit linear/lastprivate IVs
+      if (auto *symbol{iv->symbol}) {
+        //lldbg() << "LLL: symbol: " << *symbol << "\n";
+        //auto *details{symbol->detailsIf<HostAssocDetails>()};
+        //const Symbol *host{details ? &details->symbol() : nullptr};
+        const Symbol *ult{&symbol->GetUltimate()};
+        std::optional<Symbol::Flag> dsa;
+        if (linearObjs.count(ult))
+          dsa = Symbol::Flag::OmpLinear;
+        else if (lastprivateObjs.count(ult))
+          dsa = Symbol::Flag::OmpLastPrivate;
+        if (dsa.has_value()) {
+          lldbg() << "LLL: linear/lastprivate IV: " << *symbol << "\n";
+          //ivDSA = *dsa;
+          // override explicit DSA
+          auto directive{GetContext().directive};
+          if (llvm::omp::allSimdSet.test(directive) &&
+              llvm::omp::allDoSet.test(directive)) {
+            explicitDSA = true;
+            ivDSA = Symbol::Flag::OmpPrivate;
+          }
+        }
+      }
+
       if (auto *symbol{ResolveOmp(*iv, ivDSA, scope)}) {
-        SetSymbolDSA(*symbol, {Symbol::Flag::OmpPreDetermined, ivDSA});
+        SetSymbolDSA(*symbol, Symbol::Flags{Symbol::Flag::OmpPreDetermined, ivDSA});
         iv->symbol = symbol; // adjust the symbol within region
-        AddToContextObjectWithDSA(*symbol, ivDSA);
+        if (explicitDSA) {
+          AddToContextObjectWithExplicitDSA(*symbol, ivDSA);
+        } else {
+          AddToContextObjectWithDSA(*symbol, ivDSA);
+        }
       }
     }
   }
@@ -2995,17 +3062,30 @@ void OmpAttributeVisitor::ResolveOmpDesignator(
 
   // Get previous flags/DSAs
   Symbol::Flags prevFlags;
+  Symbol *symbol{};
   if (name->symbol) {
-    auto prevSym = currScope().find(name->source);
-    if (prevSym != currScope().end()) {
-      prevFlags = prevSym->second->flags();
+    auto it{currScope().find(name->source)};
+    if (it != currScope().end()) {
+      symbol = &*it->second;
+      prevFlags = symbol->flags();
     }
   }
   lldbg() << "ResolveOmpDesignator.currScope().prevFlags: "
       << prevFlags << "\n";
   Symbol::Flags prevDSAs [[maybe_unused]]{prevFlags & dataSharingAttributeFlags};
 
-  if (auto *symbol{ResolveOmp(*name, ompFlag, currScope())}) {
+  bool doSimd{llvm::omp::allDoSet.test(directive) &&
+              llvm::omp::allSimdSet.test(directive)};
+  bool setDSA{!symbol || !doSimd ||
+    (ompFlag != Symbol::Flag::OmpLastPrivate && ompFlag != Symbol::Flag::OmpLinear) ||
+    !symbol->test(Symbol::Flag::OmpExplicit) || !symbol->test(Symbol::Flag::OmpPreDetermined) ||
+    (prevFlags.test(Symbol::Flag::OmpFirstPrivate) && ompFlag == Symbol::Flag::OmpLastPrivate)
+  };
+  if (setDSA) {
+    symbol = ResolveOmp(*name, ompFlag, currScope());
+  }
+  if (symbol) {
+#if 0
     // Override PreDetermined DSA
     if (symbol->test(Symbol::Flag::OmpPreDetermined) && prevDSAs.count() == 1) {
       // Leave OmpPreDetermined flag set because some loop checks rely on it
@@ -3031,6 +3111,7 @@ void OmpAttributeVisitor::ResolveOmpDesignator(
       symbol->set(symFlag);
     }
 #endif
+#endif
 
     auto checkExclusivelists{//
         [&](const Symbol *symbol1, Symbol::Flag firstOmpFlag,
@@ -3047,7 +3128,9 @@ void OmpAttributeVisitor::ResolveOmpDesignator(
     if (dataCopyingAttributeFlags.test(ompFlag)) {
       CheckDataCopyingClause(*name, *symbol, ompFlag);
     } else {
-      AddToContextObjectWithExplicitDSA(*symbol, ompFlag);
+      if (setDSA) {
+        AddToContextObjectWithExplicitDSA(*symbol, ompFlag);
+      }
       if (dataSharingAttributeFlags.test(ompFlag)) {
         CheckMultipleAppearances(*name, *symbol, ompFlag);
       }
