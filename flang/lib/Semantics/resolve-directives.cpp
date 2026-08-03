@@ -2182,29 +2182,29 @@ void OmpAttributeVisitor::PrivatizeAssociatedLoopIndex(
   bool explicitDSA{false};
   auto getObjSymbols = [&](const parser::OmpObjectList &objs,
                            llvm::DenseSet<const Symbol *> &syms) {
-      for (const parser::OmpObject &obj : objs.v) {
-        const parser::Name *objName{};
-        common::visit(
-          common::visitors{
-              [&](const parser::Designator &designator) {
-                objName = parser::GetDesignatorNameIfDataRef(designator);
-              },
-              [&](const parser::Name &name) {
-                objName = &name;
-              },
-              [&](const auto &other) {},
-          },
+    for (const parser::OmpObject &obj : objs.v) {
+      const parser::Name *objName{};
+      common::visit(common::visitors{
+                        [&](const parser::Designator &designator) {
+                          objName =
+                              parser::GetDesignatorNameIfDataRef(designator);
+                        },
+                        [&](const parser::Name &name) { objName = &name; },
+                        [&](const auto &other) {},
+                    },
           obj.u);
-        if (objName && objName->symbol) {
-          syms.insert(&objName->symbol->GetUltimate());
-        }
+      if (objName && objName->symbol) {
+        syms.insert(&objName->symbol->GetUltimate());
       }
+    }
   };
   for (const parser::OmpClause &clause : x.BeginDir().Clauses().v) {
     if (auto *linear{std::get_if<parser::OmpClause::Linear>(&clause.u)}) {
       getObjSymbols(std::get<parser::OmpObjectList>(linear->v.t), linearObjs);
-    } else if (auto *lastprivate{std::get_if<parser::OmpClause::Lastprivate>(&clause.u)}) {
-      getObjSymbols(std::get<parser::OmpObjectList>(lastprivate->v.t), lastprivateObjs);
+    } else if (auto *lastprivate{
+                   std::get_if<parser::OmpClause::Lastprivate>(&clause.u)}) {
+      getObjSymbols(
+          std::get<parser::OmpObjectList>(lastprivate->v.t), lastprivateObjs);
     }
   }
 
@@ -3045,12 +3045,14 @@ void OmpAttributeVisitor::ResolveOmpDesignator(
     }
   }
   bool doSimd{llvm::omp::allDoSet.test(directive) &&
-              llvm::omp::allSimdSet.test(directive)};
+      llvm::omp::allSimdSet.test(directive)};
   bool setDSA{!symbol || !doSimd ||
-    (ompFlag != Symbol::Flag::OmpLastPrivate && ompFlag != Symbol::Flag::OmpLinear) ||
-    !symbol->test(Symbol::Flag::OmpExplicit) || !symbol->test(Symbol::Flag::OmpPreDetermined) ||
-    (prevFlags.test(Symbol::Flag::OmpFirstPrivate) && ompFlag == Symbol::Flag::OmpLastPrivate)
-  };
+      (ompFlag != Symbol::Flag::OmpLastPrivate &&
+          ompFlag != Symbol::Flag::OmpLinear) ||
+      !symbol->test(Symbol::Flag::OmpExplicit) ||
+      !symbol->test(Symbol::Flag::OmpPreDetermined) ||
+      (prevFlags.test(Symbol::Flag::OmpFirstPrivate) &&
+          ompFlag == Symbol::Flag::OmpLastPrivate)};
   if (setDSA) {
     symbol = ResolveOmp(*name, ompFlag, currScope());
   }
