@@ -72,7 +72,15 @@ private:
 
     void Post(const parser::Name &name) {
       auto current = !constructs.empty() ? constructs.back() : ConstructPtr();
-      symDefMap.try_emplace(name.symbol, current);
+      auto [iter, emplaced] = symDefMap.try_emplace(name.symbol, current);
+      // Take ownership of names defined in a child construct.
+      ConstructPtr &owner = iter->second;
+      if (!emplaced && owner != current) {
+        if (std::find(constructs.begin(), constructs.end(), owner) ==
+            constructs.end()) {
+          owner = current;
+        }
+      }
     }
 
     bool Pre(const parser::DeclarationConstruct &decl) {
@@ -155,6 +163,7 @@ private:
   void collectImplicitSymbols();
   void collectPreDeterminedSymbols();
   void collectIndirectReferences();
+  void filterPrivatizedSymbols();
   void privatize(mlir::omp::PrivateClauseOps *clauseOps,
                  std::optional<llvm::omp::Directive> dir = std::nullopt);
   void copyLastPrivatize(mlir::Operation *op);

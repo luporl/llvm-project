@@ -70,6 +70,37 @@
 #include "llvm/Frontend/OpenMP/OMP.h"
 #include <atomic>
 
+/// DEBUG STUFF BEGIN ///
+
+static inline std::optional<Fortran::parser::SourcePosition>
+getSrcPos [[maybe_unused]] (const Fortran::semantics::Scope &scope,
+          const Fortran::parser::CharBlock &src) {
+  using namespace Fortran;
+
+  parser::AllCookedSources &allCookedSources =
+      scope.context().allCookedSources();
+  if (std::optional<parser::ProvenanceRange> prange =
+      allCookedSources.GetProvenanceRange(src))
+    return allCookedSources.allSources().GetSourcePosition(prange->start());
+  return std::nullopt;
+}
+
+static std::string getSymbolPathLineStr [[maybe_unused]] (
+                            const Fortran::semantics::Symbol &sym) {
+  std::string s;
+  llvm::raw_string_ostream os(s);
+
+  std::optional<Fortran::parser::SourcePosition> srcpos =
+    getSrcPos(sym.owner(), sym.name());
+  if (srcpos)
+    os << *srcpos->path << ":" << srcpos->line << ":" << srcpos->column;
+  else
+    os << "<unknown_path>:<unknown_line>:<unknown_column>";
+  return s;
+}
+
+/// DEBUG STUFF END ///
+
 using namespace Fortran::lower::omp;
 using namespace Fortran::common::openmp;
 using namespace Fortran::utils::openmp;
@@ -1453,6 +1484,11 @@ createAndSetPrivatizedLoopVar(lower::AbstractConverter &converter,
                               const semantics::Symbol *sym) {
   // The handling of linear symbols is deferred to the OpenMP IRBuilder,
   // which is responsible for all its aspects, including privatization.
+  if (!(converter.isPresentShallowLookup(*sym) ||
+          sym->test(semantics::Symbol::Flag::OmpLinear))) {
+    llvm::errs() << "Expected symbol to be in symbol table.: " << *sym << '\n'
+      << "Symbol location: " << getSymbolPathLineStr(*sym) << '\n';
+  }
   assert((converter.isPresentShallowLookup(*sym) ||
           sym->test(semantics::Symbol::Flag::OmpLinear)) &&
          "Expected symbol to be in symbol table.");
