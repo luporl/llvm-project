@@ -37,35 +37,6 @@
 namespace Fortran {
 namespace lower {
 namespace omp {
-bool DataSharingProcessor::OMPConstructSymbolVisitor::isSymbolDefineBy(
-    const semantics::Symbol *symbol, lower::pft::Evaluation &eval) const {
-  auto definition = symDefMap.find(symbol);
-  if (definition == symDefMap.end())
-    return false;
-
-  // The selected variant is not an enclosing parse-tree construct, so its
-  // IVs map to a null construct. Admit only IVs owned by this variant because
-  // enclosing IVs can map to null too.
-  if (isMetadirectiveLoop)
-    return metadirectiveLoopIVs.contains(symbol) &&
-           definition->second ==
-               ConstructPtr(
-                   static_cast<const parser::OpenMPConstruct *>(nullptr));
-
-  return eval.visit(common::visitors{
-      [&](const parser::OpenMPConstruct &ompConstruct) {
-        return definition->second == ConstructPtr(&ompConstruct);
-      },
-      [](const auto &) { return false; }});
-}
-
-bool DataSharingProcessor::OMPConstructSymbolVisitor::
-    isSymbolDefineByNestedDeclaration(const semantics::Symbol *symbol) const {
-  auto definition = symDefMap.find(symbol);
-  return definition != symDefMap.end() &&
-         std::holds_alternative<const parser::DeclarationConstruct *>(
-             definition->second);
-}
 
 static bool isConstructWithTopLevelTarget(lower::pft::Evaluation &eval) {
   const auto *ompEval = eval.getIf<parser::OpenMPConstruct>();
@@ -94,52 +65,16 @@ static const semantics::Scope *getCurrentScope(
   return source.empty() ? nullptr : &semaCtx.FindScope(source);
 }
 
-static llvm::SetVector<const semantics::Symbol *> expandCommonBlockSymbols(
-    const llvm::SetVector<const semantics::Symbol *> &symbols) {
-  llvm::SetVector<const semantics::Symbol *> expandedSymbols;
-  for (const semantics::Symbol *sym : symbols) {
-    const auto *cbDetails = sym->detailsIf<semantics::CommonBlockDetails>();
-    if (cbDetails) {
-      for (const auto &cbSym : cbDetails->objects())
-        expandedSymbols.insert(&*cbSym);
-    } else {
-      expandedSymbols.insert(sym);
-    }
-  }
-  return expandedSymbols;
-}
-
-static bool isPrivate(const semantics::Symbol &symbol) {
-  using Symbol = semantics::Symbol;
-  static const Symbol::Flags privatizing{Symbol::Flag::OmpPrivate,
-      Symbol::Flag::OmpFirstPrivate, Symbol::Flag::OmpLastPrivate,
-      Symbol::Flag::OmpLinear};
-  return (symbol.flags() & privatizing).any();
-}
-
-static bool privatizedInCurrentScope(const semantics::Symbol *sym,
-      const lower::pft::Evaluation &eval, const semantics::Scope *curScope) {
-  // Consider a symbol to be privatized in the current scope if all conditions
-  // below are met:
-  // - The current directive is not a metadirective. Currently, a new scope is
-  //   not always created for metadirectives, so we can't know if a symbol was
-  //   privatized in it or in a parent directive.
-  // - The symbol is private.
-  // - The symbol is owned by the current scope.
-  // - The symbol is host association. This is needed because sometimes the
-  //   private flags are set directly in a procedure scope symbol.
-  //   TODO check if this doesn't cause problems with host symbols in nested
-  //        procedures.
-  bool isMetadirective = false;
-  const auto *ompEval = eval.getIf<parser::OpenMPConstruct>();
-  if (ompEval) {
+#if 0
+// TODO make it a lambda
+static bool isMetadirective(const lower::pft::Evaluation &eval) {
+  if (const auto *ompEval{eval.getIf<parser::OpenMPConstruct>()}) {
     llvm::omp::Directive dir = parser::omp::GetOmpDirectiveName(*ompEval).v;
-    if (dir == llvm::omp::OMPD_metadirective)
-      isMetadirective = true;
+    return dir == llvm::omp::OMPD_metadirective;
   }
-  return !isMetadirective && isPrivate(*sym) && curScope &&
-    sym->owner() == *curScope && sym->detailsIf<semantics::HostAssocDetails>();
+  return false;
 }
+#endif
 
 DataSharingProcessor::DataSharingProcessor(
     lower::AbstractConverter &converter, semantics::SemanticsContext &semaCtx,
@@ -152,20 +87,7 @@ DataSharingProcessor::DataSharingProcessor(
       shouldCollectPreDeterminedSymbols(shouldCollectPreDeterminedSymbols),
       useDelayedPrivatization(useDelayedPrivatization), symTable(symTable),
       isTargetPrivatization(isTargetPrivatization),
-      isMetadirectiveLoop(!metadirectiveLoopIVs.empty()),
-      visitor(semaCtx, metadirectiveLoopIVs) {
-  eval.visit([&](const auto &functionParserNode) {
-    parser::Walk(functionParserNode, visitor);
-  });
-  // For metadirective evaluations, the associated DO loop is spliced into the
-  // evaluation tree but is not part of the metadirective's parse tree. Walk
-  // nested evaluations' parse trees so the visitor can track their symbols
-  // (e.g. loop iteration variables).
-  if (isMetadirectiveLoop && eval.hasNestedEvaluations()) {
-    for (auto &nestedEval : eval.getNestedEvaluations())
-      nestedEval.visit([&](const auto &node) { parser::Walk(node, visitor); });
-  }
-}
+      isMetadirectiveLoop(!metadirectiveLoopIVs.empty()) {}
 
 DataSharingProcessor::DataSharingProcessor(lower::AbstractConverter &converter,
                                            semantics::SemanticsContext &semaCtx,
@@ -182,12 +104,13 @@ void DataSharingProcessor::processStep1(
     mlir::omp::PrivateClauseOps *clauseOps,
     std::optional<llvm::omp::Directive> dir) {
   collectSymbolsForPrivatization();
-  collectDefaultSymbols();
-  collectImplicitSymbols();
-  collectPreDeterminedSymbols();
-  collectIndirectReferences();
+  if (isOpenMPPrivatizingEvaluation(eval) || isMetadirectiveLoop) {
+    collectDefaultSymbols();
+    collectImplicitSymbols();
+    collectPreDeterminedSymbols();
+    collectIndirectReferences();
+  }
 
-  filterPrivatizedSymbols();
   privatize(clauseOps, dir);
 
   insertBarrier(clauseOps);
@@ -233,6 +156,7 @@ void DataSharingProcessor::cloneSymbol(const semantics::Symbol *sym) {
   bool success = [&]() -> bool {
     const auto *details =
         sym->detailsIf<Fortran::semantics::HostAssocDetails>();
+    // DEL
     if (!details) {
       llvm::errs() << "No host-association found: " << *sym << '\n'
         << "Symbol location: " << getSymbolPathLineStr(*sym) << '\n';
@@ -604,31 +528,24 @@ void DataSharingProcessor::collectSymbolsInNestedRegions(
       symbolsInNestedRegions.insert(sym);
 }
 
-// Collect all scopes associated with `eval` and return the current scope.
-static const semantics::Scope *
-collectScopes(semantics::SemanticsContext &semaCtx,
-              lower::pft::Evaluation &eval,
-              llvm::SetVector<const semantics::Scope *> &clauseScopes) {
-  std::function<void(const semantics::Scope *)> collect =
-      [&](const semantics::Scope *scope) {
-        clauseScopes.insert(scope);
-        for (const semantics::Scope &child : scope->children())
-          collect(&child);
-      };
-  parser::CharBlock source = getSource(eval);
-  const semantics::Scope *curScope = nullptr;
-  if (!source.empty()) {
-    curScope = &semaCtx.FindScope(source);
-    collect(curScope);
-  }
-  return curScope;
-}
-
+// TODO document privatization logic
 void DataSharingProcessor::collectPrivatizedSymbols(
     std::optional<semantics::Symbol::Flag> flag,
     const llvm::SetVector<const semantics::Symbol *> &allSymbols,
     const llvm::SetVector<const semantics::Symbol *> &symbolsInNestedRegions,
     llvm::SetVector<const semantics::Symbol *> *symbols) {
+#if 0
+  // Skip non-loop metadirectives, as their symbols are not owned by the
+  // metadirective, but by the enclosing scope.
+  // Besides that, metadirectives in procedure scope would trigger an
+  // "No host-association found" assert later.
+  if (!isMetadirectiveLoop && isMetadirective(eval))
+    return;
+#endif
+  const semantics::Scope *curScope = getCurrentScope(semaCtx, eval);
+  if (!curScope)
+    return;
+
   // Filter-out symbols that must not be privatized.
   bool collectImplicit = false;
   bool collectPreDetermined = false;
@@ -637,9 +554,6 @@ void DataSharingProcessor::collectPrivatizedSymbols(
     collectImplicit = *flag == semantics::Symbol::Flag::OmpImplicit;
     collectPreDetermined = *flag == semantics::Symbol::Flag::OmpPreDetermined;
   }
-
-  llvm::SetVector<const semantics::Scope *> clauseScopes;
-  const semantics::Scope *curScope = collectScopes(semaCtx, eval, clauseScopes);
 
   auto shouldCollectSymbol = [&](const semantics::Symbol *sym) {
     // Linear symbols are privatized by OpenMP IRBuilder, except when they are
@@ -663,30 +577,11 @@ void DataSharingProcessor::collectPrivatizedSymbols(
           sym->test(semantics::Symbol::Flag::OmpFirstPrivate)) {
         return false;
       }
-
-      // Collect implicit symbols only if they are not defined by a nested
-      // `DeclarationConstruct`. If `sym` is not defined by the current OpenMP
-      // evaluation then it is defined by a block nested within the OpenMP
-      // construct. This, in turn, means that the private allocation for the
-      // symbol will be emitted as part of the nested block and there is no need
-      // to privatize it within the OpenMP construct.
-      return !visitor.isSymbolDefineByNestedDeclaration(sym) &&
-             sym->test(semantics::Symbol::Flag::OmpImplicit);
+      return sym->test(semantics::Symbol::Flag::OmpImplicit);
     }
 
-    if (collectPreDetermined) {
-      // Similar to implicit symbols, collect pre-determined symbols only if
-      // they are not defined by a nested `DeclarationConstruct`
-      //
-      // TODO document the cases missed by visitor.isSymbolDefineBy(sym, eval)
-      //      only.
-      //      Example: i in non-associated loop inside a parallel.
-      DUMP_COLLECT_PREDETERMINED();
-      return (visitor.isSymbolDefineBy(sym, eval) ||
-              privatizedInCurrentScope(sym, eval, curScope)) &&
-             !visitor.isSymbolDefineByNestedDeclaration(sym) &&
-             sym->test(semantics::Symbol::Flag::OmpPreDetermined);
-    }
+    if (collectPreDetermined)
+      return sym->test(semantics::Symbol::Flag::OmpPreDetermined);
 
     if (collectIndirectRefs)
       return true;
@@ -695,30 +590,31 @@ void DataSharingProcessor::collectPrivatizedSymbols(
            !sym->test(semantics::Symbol::Flag::OmpPreDetermined);
   };
 
-  // For metadirective evaluations, the source range only covers the directive
-  // clauses, not the spliced DO loop. The scope found from that narrow range
-  // may not include parent scopes where the loop IV is declared (e.g. the
-  // function scope when the metadirective is inside a target region). Walk up
-  // the scope chain to include all ancestor scopes.
-  if (isMetadirectiveLoop && curScope) {
-    const semantics::Scope *scope = curScope;
-    while (scope->kind() != semantics::Scope::Kind::Global) {
-      clauseScopes.insert(scope);
-      scope = &scope->parent();
-    }
-  }
-
   dumpCollectPrivatizedSymbols(eval, curScope, flag);
   dumpSymbols("symbolsInNestedRegions", symbolsInNestedRegions);
 
+  // XXX STOPPED HERE
   for (const auto *sym : allSymbols) {
     DUMP_PRIV();
+
+    // Metadirective loops also "owns" symbols in nested directives, so
+    // checking only the owner is not correct (mention the spliced do stuff).
+    // (condition is relaxed)
+    //
+    // DEL
+    // The additional symbols collected by metadirective loops, from their
+    // nested evals, may also be privatized in nested directives, if not
+    // properly collected in symbolsInNestedRegions, which seems to be the
+    // case already. In worst case, they will be privatized twice, which is
+    // only a performance issue.
+    // Skipping the privatization of metadirective(parallel), for instance, is
+    // strange, and seems incorrect. Just argue that I'm not familiar with
+    // metadirectives. Suggest future improvements for metadirectives.
     if (semantics::omp::IsPrivatizable(*sym) &&
         !symbolsInNestedRegions.contains(sym) &&
         !explicitlyPrivatizedSymbols.contains(sym) &&
-        shouldCollectSymbol(sym) && clauseScopes.contains(&sym->owner()) &&
-        // privatizedInCurrentScope(sym, eval, curScope)
-        (isMetadirectiveLoop || (curScope && sym->owner() == *curScope))) {
+        shouldCollectSymbol(sym) &&
+        (isMetadirectiveLoop || sym->owner() == *curScope)) {
       lldbg() << "LLL: privatize: " << *sym << '\n';
       allPrivatizedSymbols.insert(sym);
       if (symbols)
@@ -754,13 +650,6 @@ void DataSharingProcessor::collectSymbols(
 
   llvm::SetVector<const semantics::Symbol *> symbolsInNestedRegions;
   collectSymbolsInNestedRegions(eval, flag, symbolsInNestedRegions);
-
-#if 0
-  for (auto *symbol : allSymbols)
-    if (visitor.isSymbolDefineBy(symbol, eval) ||
-        privatizedInCurrentScope(symbol, eval, getCurrentScope(semaCtx, eval)))
-      symbolsInNestedRegions.remove(symbol);
-#endif
 
   collectPrivatizedSymbols(flag, allSymbols, symbolsInNestedRegions);
 }
@@ -815,12 +704,6 @@ void DataSharingProcessor::collectIndirectReferences() {
   collect(semantics::Symbol::Flag::OmpLinear);
   collect(semantics::Symbol::Flag::OmpLastPrivate);
 
-#if 0
-  for (auto *symbol : allSymbols)
-    if (visitor.isSymbolDefineBy(symbol, eval))
-      symbolsInNestedRegions.remove(symbol);
-#endif
-
   auto isPrivate = [](const semantics::Symbol &sym) {
     using Symbol = semantics::Symbol;
     Symbol::Flags privateFlags{
@@ -855,52 +738,6 @@ void DataSharingProcessor::collectIndirectReferences() {
 
   collectPrivatizedSymbols(std::nullopt, indirectReferences,
                            symbolsInNestedRegions);
-}
-
-void DataSharingProcessor::filterPrivatizedSymbols() {
-  // XXX STOPPED HERE
-  dumpSymbols("before_filter", allPrivatizedSymbols);
-
-  const semantics::Scope *curScope = getCurrentScope(semaCtx, eval);
-
-  auto getParent = [](const semantics::Symbol *sym)
-                          -> const semantics::Symbol * {
-    const auto *details = sym->detailsIf<semantics::HostAssocDetails>();
-    if (!details)
-      return nullptr;
-    return &details->symbol();
-  };
-
-  // Get the ancestor symbol of `sym` in the current scope, if any.
-  auto curScopeAncestorSymbol = [&](const semantics::Symbol *sym)
-                                -> const semantics::Symbol * {
-    if (!curScope)
-      return nullptr;
-    for (const semantics::Symbol *parent = sym; parent;
-          parent = getParent(parent)) {
-      if (parent->owner() == *curScope)
-        return parent;
-    }
-    return nullptr;
-  };
-
-  llvm::SmallVector<const semantics::Symbol *> delSyms;
-
-  // Delete symbols that are not private in the current scope.
-  // FIXME check if deletion of symbols in common blocks is correct
-  if (curScope) {
-    for (const semantics::Symbol *sym :
-        expandCommonBlockSymbols(allPrivatizedSymbols)) {
-      const semantics::Symbol *curSym = curScopeAncestorSymbol(sym);
-      if (curSym && !isPrivate(*curSym))
-        delSyms.push_back(sym);
-    }
-  }
-
-  for (const semantics::Symbol *sym : delSyms)
-    allPrivatizedSymbols.remove(sym);
-
-  dumpSymbols("after_filter", allPrivatizedSymbols);
 }
 
 void DataSharingProcessor::privatize(mlir::omp::PrivateClauseOps *clauseOps,
@@ -947,104 +784,3 @@ void DataSharingProcessor::privatizeSymbol(
 } // namespace omp
 } // namespace lower
 } // namespace Fortran
-
-/// UNUSED ///
-
-#if 0
-
-void DataSharingProcessor::collectSymbolsInNestedRegions(
-    lower::pft::Evaluation &eval, semantics::Symbol::Flag flag,
-    llvm::SetVector<const semantics::Symbol *> &symbolsInNestedRegions) {
-  // TODO think about the logic and add tests
-  // The rationale is that the privatizaion of symbols that appear in multiple
-  // nested evals shouldn't have their privatization skipped in the current
-  // level.
-  // Example (check this):
-  // !$omp parallel
-  //   !$omp do
-  //     do i = 1, 10
-  //       do j = 1, 10
-  //       end do
-  //     end do
-  //   j = 10
-  // !$omp end parallel
-  // i belongs to parallel and shouldn't be considered as nested in omp_do,
-  // as it is also referenced outside it.
-  // A more elaborated fix should consider each symbol separately, removing
-  // only those that appear in multiple evals.
-  // But there is no problem in privatizing a symbol one more time, it's just
-  // a bit less effective.
-  // TODO just document the rationale and leave the logic like this.
-  llvm::SetVector<const semantics::Symbol *> collectedSymbols;
-  int nestedPrivatizingEvals = 0;
-  if (!eval.hasNestedEvaluations())
-    return;
-  dumpSymbols("symbolsInNestedRegions(before)", symbolsInNestedRegions);
-  for (pft::Evaluation &nestedEval : eval.getNestedEvaluations()) {
-    if (isOpenMPPrivatizingEvaluation(nestedEval)) {
-      llvm::SetVector<const semantics::Symbol *> symbols;
-      converter.collectSymbolSet(nestedEval, symbols, flag,
-                                  /*collectSymbols=*/true,
-                                  /*collectHostAssociatedSymbols=*/false);
-      if (!symbols.empty()) {
-        dumpSymbols("symbols", symbols);
-        nestedPrivatizingEvals++;
-        collectedSymbols.insert_range(symbols);
-        //lldbg() << "LLL: symbolsInNested: OMPPriv: count: " << nestedPrivatizingEvals << '\n';
-      }
-    } else {
-      // Recursively look for OpenMP constructs within `nestedEval`'s region
-      llvm::SetVector<const semantics::Symbol *> symbols;
-      collectSymbolsInNestedRegions(nestedEval, flag, symbols);
-      if (!symbols.empty()) {
-        dumpSymbols("symbols", symbols);
-        nestedPrivatizingEvals++;
-        collectedSymbols.insert_range(symbols);
-        //lldbg() << "LLL: symbolsInNested: REC: count: " << nestedPrivatizingEvals << '\n';
-      }
-    }
-  }
-  if (nestedPrivatizingEvals == 1)
-    symbolsInNestedRegions.insert_range(collectedSymbols);
-  dumpSymbols("collectedSymbols", collectedSymbols);
-  dumpSymbols("symbolsInNestedRegions(after)", symbolsInNestedRegions);
-}
-
-void DataSharingProcessor::filterPrivatizedSymbols() {
-  // Is `sym1` an ancestor of `sym2`?
-  auto isAncestor = [getParent](const semantics::Symbol *sym1,
-                        const semantics::Symbol *sym2) {
-    for (const semantics::Symbol *parent = getParent(sym2); parent;
-          parent = getParent(parent)) {
-      if (parent == sym1)
-        return true;
-    }
-    return false;
-  };
-
-  // Is `sym1` an ancestor of `sym2`?
-  auto isAncestor = [getParent](const semantics::Symbol *sym1,
-                        const semantics::Symbol *sym2) {
-    for (const semantics::Symbol *parent = getParent(sym2); parent;
-          parent = getParent(parent)) {
-      if (parent == sym1)
-        return true;
-    }
-    return false;
-  };
-
-  // Delete symbols whose ancestor is already being privatized.
-  // TODO handle common blocks
-  // TODO try to reduce complexity order
-  llvm::SmallVector<const semantics::Symbol *> delSyms;
-  for (const semantics::Symbol *sym1 : allPrivatizedSymbols) {
-    for (const semantics::Symbol *sym2 : allPrivatizedSymbols) {
-      if (sym1 == sym2)
-        continue;
-      if (isAncestor(sym1, sym2))
-        delSyms.push_back(sym2);
-    }
-  }
-}
-
-#endif
