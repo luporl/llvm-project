@@ -510,7 +510,27 @@ void DataSharingProcessor::collectSymbolsInNestedRegions(
       symbolsInNestedRegions.insert(sym);
 }
 
-// TODO document privatization logic
+// Collect symbols that `eval` must privatize, but whose data-sharing attributes
+// (DSA) are not explicitly determined.
+//
+// `flag` selects the kind of symbols being collected:
+//   - OmpPrivate / OmpFirstPrivate: symbols privatized by a DEFAULT clause.
+//   - OmpImplicit: symbols with an implicitly determined DSA.
+//   - OmpPreDetermined: symbols with a predetermined DSA.
+//   - std::nullopt: indirect references (see collectIndirectReferences()).
+//
+// `allSymbols` contains the symbols referenced in `eval` (or the indirect
+// references, when `flag` is not set).
+// `symbolsInNestedRegions` contains the symbols referenced in privatizing
+// constructs nested in `eval` that are not owned by `eval`'s scope. When
+// `flag` is set, both sets are restricted to symbols that have it.
+//
+// Excluding some special cases, a symbol is privatized if it is in
+// `allSymbols` but not in `symbolsInNestedRegions`, and it is owned by
+// `eval`'s scope, meaning semantics assigned its DSA to this construct.
+//
+// The selected symbols are added to `allPrivatizedSymbols`, and also to
+// `*symbols` when `symbols` is not null.
 void DataSharingProcessor::collectPrivatizedSymbols(
     std::optional<semantics::Symbol::Flag> flag,
     const llvm::SetVector<const semantics::Symbol *> &allSymbols,
@@ -565,19 +585,9 @@ void DataSharingProcessor::collectPrivatizedSymbols(
   };
 
   for (const auto *sym : allSymbols) {
-    // Metadirective loops also "owns" symbols in nested directives, so
-    // checking only the owner is not correct (mention the spliced do stuff).
-    // (condition is relaxed)
-    //
-    // DEL
-    // The additional symbols collected by metadirective loops, from their
-    // nested evals, may also be privatized in nested directives, if not
-    // properly collected in symbolsInNestedRegions, which seems to be the
-    // case already. In worst case, they will be privatized twice, which is
-    // only a performance issue.
-    // Skipping the privatization of metadirective(parallel), for instance, is
-    // strange, and seems incorrect. Just argue that I'm not familiar with
-    // metadirectives. Suggest future improvements for metadirectives.
+    // Metadirective loops also have symbols in spliced nested evaluations,
+    // which means that not all symbols that must be privatized will be owned
+    // by the current scope.
     if (semantics::omp::IsPrivatizable(*sym) &&
         !symbolsInNestedRegions.contains(sym) &&
         !explicitlyPrivatizedSymbols.contains(sym) &&
@@ -590,13 +600,6 @@ void DataSharingProcessor::collectPrivatizedSymbols(
   }
 }
 
-// Collect symbols to be default privatized in two steps.
-// In step 1, collect all symbols in `eval` that match `flag` into
-// `defaultSymbols`. In step 2, for nested constructs (if any), if and only if
-// the nested construct is an OpenMP construct, collect those nested
-// symbols skipping host associated symbols into `symbolsInNestedRegions`.
-// Later, in current context, all symbols in the set
-// `defaultSymbols` - `symbolsInNestedRegions` will be privatized.
 void DataSharingProcessor::collectSymbols(
     semantics::Symbol::Flag flag,
     llvm::SetVector<const semantics::Symbol *> *symbols) {
