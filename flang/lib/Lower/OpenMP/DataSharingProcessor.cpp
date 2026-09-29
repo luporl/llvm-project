@@ -58,9 +58,9 @@ static parser::CharBlock getSource(const lower::pft::Evaluation &eval) {
   });
 }
 
-static const semantics::Scope *getCurrentScope(
-    const semantics::SemanticsContext &semaCtx,
-    const lower::pft::Evaluation &eval) {
+static const semantics::Scope *
+getCurrentScope(const semantics::SemanticsContext &semaCtx,
+                const lower::pft::Evaluation &eval) {
   parser::CharBlock source = getSource(eval);
   return source.empty() ? nullptr : &semaCtx.FindScope(source);
 }
@@ -159,7 +159,7 @@ void DataSharingProcessor::cloneSymbol(const semantics::Symbol *sym) {
     // DEL
     if (!details) {
       llvm::errs() << "No host-association found: " << *sym << '\n'
-        << "Symbol location: " << getSymbolPathLineStr(*sym) << '\n';
+                   << "Symbol location: " << getSymbolPathLineStr(*sym) << '\n';
     }
     assert(details && "No host-association found");
     const Fortran::semantics::Symbol &hsym = details->symbol();
