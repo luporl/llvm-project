@@ -32,8 +32,6 @@
 #include "llvm/Frontend/OpenMP/OMP.h"
 #include <variant>
 
-#include "flang/lldbg.h"
-
 namespace Fortran {
 namespace lower {
 namespace omp {
@@ -64,17 +62,6 @@ getCurrentScope(const semantics::SemanticsContext &semaCtx,
   parser::CharBlock source = getSource(eval);
   return source.empty() ? nullptr : &semaCtx.FindScope(source);
 }
-
-#if 0
-// TODO make it a lambda
-static bool isMetadirective(const lower::pft::Evaluation &eval) {
-  if (const auto *ompEval{eval.getIf<parser::OpenMPConstruct>()}) {
-    llvm::omp::Directive dir = parser::omp::GetOmpDirectiveName(*ompEval).v;
-    return dir == llvm::omp::OMPD_metadirective;
-  }
-  return false;
-}
-#endif
 
 DataSharingProcessor::DataSharingProcessor(
     lower::AbstractConverter &converter, semantics::SemanticsContext &semaCtx,
@@ -156,11 +143,6 @@ void DataSharingProcessor::cloneSymbol(const semantics::Symbol *sym) {
   bool success = [&]() -> bool {
     const auto *details =
         sym->detailsIf<Fortran::semantics::HostAssocDetails>();
-    // DEL
-    if (!details) {
-      llvm::errs() << "No host-association found: " << *sym << '\n'
-                   << "Symbol location: " << getSymbolPathLineStr(*sym) << '\n';
-    }
     assert(details && "No host-association found");
     const Fortran::semantics::Symbol &hsym = details->symbol();
     mlir::Value addr = converter.getSymbolAddress(hsym);
@@ -534,14 +516,6 @@ void DataSharingProcessor::collectPrivatizedSymbols(
     const llvm::SetVector<const semantics::Symbol *> &allSymbols,
     const llvm::SetVector<const semantics::Symbol *> &symbolsInNestedRegions,
     llvm::SetVector<const semantics::Symbol *> *symbols) {
-#if 0
-  // Skip non-loop metadirectives, as their symbols are not owned by the
-  // metadirective, but by the enclosing scope.
-  // Besides that, metadirectives in procedure scope would trigger an
-  // "No host-association found" assert later.
-  if (!isMetadirectiveLoop && isMetadirective(eval))
-    return;
-#endif
   const semantics::Scope *curScope = getCurrentScope(semaCtx, eval);
   if (!curScope)
     return;
@@ -590,13 +564,7 @@ void DataSharingProcessor::collectPrivatizedSymbols(
            !sym->test(semantics::Symbol::Flag::OmpPreDetermined);
   };
 
-  dumpCollectPrivatizedSymbols(eval, curScope, flag);
-  dumpSymbols("symbolsInNestedRegions", symbolsInNestedRegions);
-
-  // XXX STOPPED HERE
   for (const auto *sym : allSymbols) {
-    DUMP_PRIV();
-
     // Metadirective loops also "owns" symbols in nested directives, so
     // checking only the owner is not correct (mention the spliced do stuff).
     // (condition is relaxed)
@@ -615,7 +583,6 @@ void DataSharingProcessor::collectPrivatizedSymbols(
         !explicitlyPrivatizedSymbols.contains(sym) &&
         shouldCollectSymbol(sym) &&
         (isMetadirectiveLoop || sym->owner() == *curScope)) {
-      lldbg() << "LLL: privatize: " << *sym << '\n';
       allPrivatizedSymbols.insert(sym);
       if (symbols)
         symbols->insert(sym);
