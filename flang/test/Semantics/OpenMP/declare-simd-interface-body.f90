@@ -6,14 +6,12 @@
 
 interface
   subroutine add2(i)
-  !WARNING: DECLARE SIMD directive is not implemented yet and will be ignored
   !WARNING: 'DECLARE SIMD' directive in an interface body has no effect [-Wopenmp-usage]
   !$omp declare simd(add2) linear(i:1)
     integer :: i
   end subroutine
 
   subroutine add3(i)
-  !WARNING: DECLARE SIMD directive is not implemented yet and will be ignored
   !WARNING: 'DECLARE SIMD' directive in an interface body has no effect [-Wopenmp-usage]
   !$omp declare simd
     integer :: i
@@ -25,7 +23,6 @@ contains
 ! A DECLARE SIMD in an actual definition is fine and must not warn about
 ! its effect.
 subroutine sub(i)
-!WARNING: DECLARE SIMD directive is not implemented yet and will be ignored
 !$omp declare simd(sub) linear(i:1)
   integer :: i
   i = i + 1

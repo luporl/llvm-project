@@ -2203,12 +2203,7 @@ void OmpStructureChecker::Enter(const parser::OmpAssumesDirective &directive) {
 
 void OmpStructureChecker::Enter(const parser::OmpDeclareSimdDirective &x) {
   const parser::OmpDirectiveName &dirName{x.v.DirName()};
-
   llvm::omp::Version version{context_.langOptions().getOpenMPVersion()};
-
-  context_.Say(dirName.source,
-      "%s directive is not implemented yet and will be ignored"_warn_en_US,
-      GetUpperName(dirName.v, version));
 
   const Scope &containingScope = context_.FindScope(dirName.source);
   const Scope &progUnitScope = GetProgramUnitContaining(containingScope);
