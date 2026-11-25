@@ -155,6 +155,7 @@
 #include "llvm/Transforms/Utils/NameAnonGlobals.h"
 #include "llvm/Transforms/Utils/ProfileVerify.h"
 #include "llvm/Transforms/Utils/RelLookupTableConverter.h"
+#include "llvm/Transforms/Utils/VecClone.h"
 #include "llvm/Transforms/Utils/SimplifyCFGOptions.h"
 #include "llvm/Transforms/Vectorize/LoopVectorize.h"
 #include "llvm/Transforms/Vectorize/SLPVectorizer.h"
@@ -1588,9 +1589,12 @@ PassBuilder::buildModuleOptimizationPipeline(OptimizationLevel Level,
                           .speculateUnpredictables(true)
                           .hoistLoadsStoresWithCondFaulting(true)));
 
-  // Enable LoopVectorize for OpenMP declare simd.
-  if (Opts.enable_openmp_vfabi_mappings)
+  // Enable LoopVectorize for OpenMP declare simd: synthesize the vector
+  // variants of local declare simd functions (VecClone), then map all variants.
+  if (Opts.enable_openmp_vfabi_mappings) {
+    MPM.addPass(VecClonePass());
     MPM.addPass(InjectOpenMPVFABIMappings());
+  }
 
   // Add the core optimizing pipeline.
   MPM.addPass(createModuleToFunctionPassAdaptor(
@@ -2351,6 +2355,10 @@ PassBuilder::buildO0DefaultPipeline(OptimizationLevel Level,
         /*RunProfileGen=*/(PGOOpt->Action == PGOOptions::IRInstr),
         /*IsCS=*/false, PGOOpt->AtomicCounterUpdate, PGOOpt->ProfileFile,
         PGOOpt->ProfileRemappingFile);
+
+  // Synthesize OpenMP declare simd vector variants (required by the ABI).
+  if (Opts.enable_openmp_vfabi_mappings)
+    MPM.addPass(VecClonePass());
 
   // Instrument function entry and exit before all inlining.
   MPM.addPass(createModuleToFunctionPassAdaptor(

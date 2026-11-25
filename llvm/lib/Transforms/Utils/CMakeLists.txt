@@ -97,6 +97,7 @@ add_llvm_component_library(LLVMTransformUtils
   UnifyLoopExits.cpp
   Utils.cpp
   ValueMapper.cpp
+  VecClone.cpp
   VNCoercion.cpp
 
   ADDITIONAL_HEADER_DIRS
