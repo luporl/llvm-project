@@ -70,6 +70,8 @@ defm : BoolField<"enable-module-inliner", "false",
   "Enable module inliner">;
 defm : BoolField<"enable-newgvn", "false",
   "Run the NewGVN pass">;
+defm : BoolField<"enable-openmp-vfabi-mappings", "false",
+  "Inject OpenMP declare simd VFABI mappings for LoopVectorize">;
 defm : BoolField<"enable-npm-pgo-inline-deferral", "true",
   "Enable inline deferral during PGO">;
 defm : BoolField<"enable-partial-inlining", "false",
